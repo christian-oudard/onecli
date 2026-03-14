@@ -6,7 +6,6 @@
   outputs = { self, nixpkgs }: let
     system = "x86_64-linux";
     pkgs = import nixpkgs { inherit system; };
-    pnpm = pkgs.pnpm_9;
     nodejs = pkgs.nodejs_22;
 
     gateway = pkgs.rustPlatform.buildRustPackage {
@@ -19,11 +18,11 @@
     # Pre-fetch pnpm dependencies (fixed-output derivation).
     # To compute the hash: run `nix build .#web` with an empty hash,
     # nix will print the expected hash in the error message.
-    pnpmDeps = pnpm.fetchDeps {
+    pnpmDeps = pkgs.pnpm_9.fetchDeps {
       pname = "onecli-web-deps";
       version = "0.1.0";
       src = ./.;
-      hash = "";  # Replace with actual hash from `nix build .#web`
+      hash = "sha256-AYbSzIMvTaLo1iYStY3aWBRr29phtr7jFPebZLK2KU0=";
       fetcherVersion = 3;
     };
 
@@ -34,7 +33,7 @@
 
       nativeBuildInputs = [
         nodejs
-        pnpm.configHook
+        pkgs.pnpm_9.configHook
       ];
 
       inherit pnpmDeps;
@@ -228,7 +227,7 @@
       buildInputs = [
         gateway
         nodejs
-        pnpm
+        pkgs.pnpm_9
       ];
     };
   };
