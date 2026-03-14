@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import localFont from "next/font/local";
-import { Source_Serif_4 } from "next/font/google";
 import "@onecli/ui/globals.css";
 import "./globals.css";
 import { AuthProvider } from "@/providers/auth-provider";
@@ -16,8 +15,11 @@ const geistMono = localFont({
   src: "./fonts/GeistMonoVF.woff",
   variable: "--font-geist-mono",
 });
-const sourceSerif = Source_Serif_4({
-  subsets: ["latin"],
+const sourceSerif = localFont({
+  src: [
+    { path: "./fonts/SourceSerif4VF.woff2", style: "normal" },
+    { path: "./fonts/SourceSerif4VF-Italic.woff2", style: "italic" },
+  ],
   variable: "--font-serif",
 });
 
