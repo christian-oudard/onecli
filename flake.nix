@@ -34,7 +34,7 @@
       nativeBuildInputs = [
         nodejs
         pkgs.pnpm_9.configHook
-        pkgs.prisma-engines
+        pkgs.prisma-engines_6
       ];
 
       inherit pnpmDeps;
@@ -44,8 +44,8 @@
         # Dummy DATABASE_URL prevents PGlite from initializing during build
         DATABASE_URL = "postgresql://build:build@localhost/build";
         # Use nix-provided Prisma engines instead of downloading
-        PRISMA_QUERY_ENGINE_LIBRARY = "${pkgs.prisma-engines}/lib/libquery_engine.node";
-        PRISMA_SCHEMA_ENGINE_BINARY = "${pkgs.prisma-engines}/bin/schema-engine";
+        PRISMA_QUERY_ENGINE_LIBRARY = "${pkgs.prisma-engines_6}/lib/libquery_engine.node";
+        PRISMA_SCHEMA_ENGINE_BINARY = "${pkgs.prisma-engines_6}/bin/schema-engine";
         PRISMA_ENGINES_CHECKSUM_IGNORE_MISSING = "1";
       };
 
@@ -62,6 +62,10 @@
 
         # Next.js standalone output
         cp -r apps/web/.next/standalone/* $out/
+
+        # Next.js standalone traces only runtime deps, but pnpm's hoisted
+        # symlinks to build-time-only packages survive the copy as dangling links.
+        find $out -xtype l -delete
         cp -r apps/web/.next/static $out/apps/web/.next/static
         if [ -d apps/web/public ]; then
           cp -r apps/web/public $out/apps/web/public
