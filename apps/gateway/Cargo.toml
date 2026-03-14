@@ -49,6 +49,9 @@ base64 = "0.22"
 # Stream combinators
 futures-util = "0.3"
 
+# TOML parsing (local mode rules)
+toml = "0.8"
+
 # Error handling
 anyhow = "1"
 

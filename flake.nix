@@ -34,6 +34,7 @@
       nativeBuildInputs = [
         nodejs
         pkgs.pnpm_9.configHook
+        pkgs.prisma-engines
       ];
 
       inherit pnpmDeps;
@@ -42,6 +43,10 @@
         NEXT_TELEMETRY_DISABLED = "1";
         # Dummy DATABASE_URL prevents PGlite from initializing during build
         DATABASE_URL = "postgresql://build:build@localhost/build";
+        # Use nix-provided Prisma engines instead of downloading
+        PRISMA_QUERY_ENGINE_LIBRARY = "${pkgs.prisma-engines}/lib/libquery_engine.node";
+        PRISMA_SCHEMA_ENGINE_BINARY = "${pkgs.prisma-engines}/bin/schema-engine";
+        PRISMA_ENGINES_CHECKSUM_IGNORE_MISSING = "1";
       };
 
       buildPhase = ''
@@ -113,6 +118,7 @@
       # Start gateway in background
       ${gateway}/bin/onecli-gateway \
         --port "$GATEWAY_PORT" \
+        --bind "''${GATEWAY_BIND:-0.0.0.0}" \
         --data-dir "$DATA_DIR" \
         --gateway-secret-file "$GATEWAY_SECRET_FILE" &
       GATEWAY_PID=$!
@@ -140,8 +146,21 @@
 
       exec ${gateway}/bin/onecli-gateway \
         --port "''${GATEWAY_PORT:-10255}" \
+        --bind "''${GATEWAY_BIND:-0.0.0.0}" \
         --data-dir "$DATA_DIR" \
         --gateway-secret-file "$GATEWAY_SECRET_FILE" \
+        "$@"
+    '';
+
+    # Gateway in local mode — reads rules from TOML, no web dashboard needed
+    gateway-local = pkgs.writeShellScriptBin "onecli-gateway-local" ''
+      DATA_DIR="''${ONECLI_DATA_DIR:-$HOME/.onecli}"
+      mkdir -p "$DATA_DIR"
+
+      exec ${gateway}/bin/onecli-gateway \
+        --local \
+        --port "''${GATEWAY_PORT:-10255}" \
+        --data-dir "$DATA_DIR" \
         "$@"
     '';
 
@@ -149,6 +168,7 @@
     packages.${system} = {
       inherit gateway web;
       gateway-runner = gateway-runner;
+      gateway-local = gateway-local;
       default = entrypoint;
     };
 

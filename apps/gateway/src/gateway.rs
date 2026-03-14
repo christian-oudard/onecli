@@ -24,6 +24,20 @@ use tracing::{info, warn};
 use crate::ca::CertificateAuthority;
 use crate::connect::{self, CachedConnect, ConnectCacheKey, ConnectError};
 use crate::inject::{self, ConnectRule};
+use crate::local::ResolvedLocalRule;
+
+// ── Mode ────────────────────────────────────────────────────────────────
+
+/// How the gateway resolves injection rules for incoming connections.
+pub(crate) enum Mode {
+    /// Fetch rules from the OneCLI web API (multi-tenant, token-authenticated).
+    Api {
+        api_url: Arc<str>,
+        gateway_secret: Option<Arc<str>>,
+    },
+    /// Load rules from a local TOML file (single-user, no auth).
+    Local(Vec<ResolvedLocalRule>),
+}
 
 // ── GatewayServer ───────────────────────────────────────────────────────
 
@@ -31,12 +45,9 @@ pub struct GatewayServer {
     ca: Arc<CertificateAuthority>,
     http_client: reqwest::Client,
     port: u16,
-    /// OneCLI web API base URL (for credential fetching).
-    api_url: Arc<str>,
-    /// Shared secret for authenticating requests to the web API.
-    /// `None` if no secret is configured (credential fetching disabled).
-    gateway_secret: Option<Arc<str>>,
-    /// Cache of resolved connect responses per (agent_token, host).
+    bind_addr: String,
+    mode: Arc<Mode>,
+    /// Cache of resolved connect responses per (agent_token, host) — API mode only.
     connect_cache: Arc<DashMap<ConnectCacheKey, CachedConnect>>,
 }
 
@@ -44,8 +55,8 @@ impl GatewayServer {
     pub fn new(
         ca: CertificateAuthority,
         port: u16,
-        api_url: String,
-        gateway_secret: Option<String>,
+        bind_addr: String,
+        mode: Mode,
     ) -> Self {
         Self {
             ca: Arc::new(ca),
@@ -56,15 +67,17 @@ impl GatewayServer {
                 .build()
                 .expect("build HTTP client"),
             port,
-            api_url: Arc::from(api_url.as_str()),
-            gateway_secret: gateway_secret.map(|s| Arc::from(s.as_str())),
+            bind_addr,
+            mode: Arc::new(mode),
             connect_cache: Arc::new(DashMap::new()),
         }
     }
 
     /// Start the gateway TCP listener. Runs forever.
     pub async fn run(&self) -> Result<()> {
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
+        let addr: SocketAddr = format!("{}:{}", self.bind_addr, self.port)
+            .parse()
+            .context("parsing bind address")?;
         let listener = TcpListener::bind(addr)
             .await
             .context("binding TCP listener")?;
@@ -75,8 +88,7 @@ impl GatewayServer {
             let (stream, peer_addr) = listener.accept().await?;
             let ca = Arc::clone(&self.ca);
             let http_client = self.http_client.clone();
-            let api_url = Arc::clone(&self.api_url);
-            let gateway_secret = self.gateway_secret.clone();
+            let mode = Arc::clone(&self.mode);
             let connect_cache = Arc::clone(&self.connect_cache);
 
             tokio::spawn(async move {
@@ -85,8 +97,7 @@ impl GatewayServer {
                     peer_addr,
                     ca,
                     http_client,
-                    api_url,
-                    gateway_secret,
+                    mode,
                     connect_cache,
                 )
                 .await
@@ -107,8 +118,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     ca: Arc<CertificateAuthority>,
     http_client: reqwest::Client,
-    api_url: Arc<str>,
-    gateway_secret: Option<Arc<str>>,
+    mode: Arc<Mode>,
     connect_cache: Arc<DashMap<ConnectCacheKey, CachedConnect>>,
 ) -> Result<()> {
     let io = TokioIo::new(stream);
@@ -121,8 +131,7 @@ async fn handle_connection(
             service_fn(move |req| {
                 let ca = Arc::clone(&ca);
                 let http_client = http_client.clone();
-                let api_url = Arc::clone(&api_url);
-                let gateway_secret = gateway_secret.clone();
+                let mode = Arc::clone(&mode);
                 let connect_cache = Arc::clone(&connect_cache);
                 async move {
                     handle_request(
@@ -130,8 +139,7 @@ async fn handle_connection(
                         peer_addr,
                         ca,
                         http_client,
-                        api_url,
-                        gateway_secret,
+                        mode,
                         connect_cache,
                     )
                     .await
@@ -149,8 +157,7 @@ async fn handle_request(
     peer_addr: SocketAddr,
     ca: Arc<CertificateAuthority>,
     http_client: reqwest::Client,
-    api_url: Arc<str>,
-    gateway_secret: Option<Arc<str>>,
+    mode: Arc<Mode>,
     connect_cache: Arc<DashMap<ConnectCacheKey, CachedConnect>>,
 ) -> Result<Response<Empty<Bytes>>, anyhow::Error> {
     if req.method() == Method::CONNECT {
@@ -162,36 +169,47 @@ async fn handle_request(
 
         let hostname = strip_port(&host).to_string();
 
-        // Extract agent token from Proxy-Authorization header.
-        // Convention: Basic base64("x:{token}") — token in password field.
-        let agent_token = inject::extract_agent_token(&req).filter(|t| !t.is_empty());
+        let (intercept, rules) = match mode.as_ref() {
+            Mode::Local(local_rules) => {
+                // Local mode: match hostname against TOML rules, no auth needed
+                crate::local::resolve(&hostname, local_rules)
+            }
+            Mode::Api {
+                api_url,
+                gateway_secret,
+            } => {
+                // API mode: extract agent token, call web API
+                let agent_token =
+                    inject::extract_agent_token(&req).filter(|t| !t.is_empty());
 
-        let (intercept, rules) = if let Some(ref token) = agent_token {
-            match connect::resolve(
-                token,
-                &hostname,
-                &http_client,
-                &api_url,
-                gateway_secret.as_deref(),
-                &connect_cache,
-            )
-            .await
-            {
-                Ok(resp) => (resp.intercept, resp.rules),
-                Err(ConnectError::InvalidToken) => {
-                    warn!(peer = %peer_addr, host = %host, "CONNECT rejected: invalid agent token");
-                    return Ok(respond_407());
-                }
-                Err(ConnectError::ApiUnreachable(e)) => {
-                    warn!(peer = %peer_addr, host = %host, error = %e, "CONNECT rejected: API unreachable");
-                    let mut resp = Response::new(Empty::new());
-                    *resp.status_mut() = hyper::StatusCode::BAD_GATEWAY;
-                    return Ok(resp);
+                if let Some(ref token) = agent_token {
+                    match connect::resolve(
+                        token,
+                        &hostname,
+                        &http_client,
+                        api_url,
+                        gateway_secret.as_deref(),
+                        &connect_cache,
+                    )
+                    .await
+                    {
+                        Ok(resp) => (resp.intercept, resp.rules),
+                        Err(ConnectError::InvalidToken) => {
+                            warn!(peer = %peer_addr, host = %host, "CONNECT rejected: invalid agent token");
+                            return Ok(respond_407());
+                        }
+                        Err(ConnectError::ApiUnreachable(e)) => {
+                            warn!(peer = %peer_addr, host = %host, error = %e, "CONNECT rejected: API unreachable");
+                            let mut resp = Response::new(Empty::new());
+                            *resp.status_mut() = hyper::StatusCode::BAD_GATEWAY;
+                            return Ok(resp);
+                        }
+                    }
+                } else {
+                    // No auth — plain tunnel (no MITM, no injection)
+                    (false, vec![])
                 }
             }
-        } else {
-            // No auth — plain tunnel (no MITM, no injection)
-            (false, vec![])
         };
 
         info!(
