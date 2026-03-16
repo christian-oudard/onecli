@@ -161,7 +161,6 @@
     gateway-local = pkgs.writeShellScriptBin "onecli-gateway-local" ''
       exec ${gateway}/bin/onecli-gateway \
         --local \
-        --port "''${GATEWAY_PORT:-10255}" \
         "$@"
     '';
 
