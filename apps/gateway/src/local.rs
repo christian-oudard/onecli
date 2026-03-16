@@ -129,6 +129,19 @@ fn resolve_value(entry: &TomlInjection, rules_path: &Path) -> Result<String> {
     }
     if let Some(ref file_path) = entry.value_file {
         let expanded = expand_tilde(file_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = std::fs::metadata(&expanded) {
+                if meta.mode() & 0o077 != 0 {
+                    tracing::warn!(
+                        path = %expanded.display(),
+                        mode = format!("{:o}", meta.mode() & 0o777),
+                        "secret file has group/world permissions — consider chmod 600"
+                    );
+                }
+            }
+        }
         let content = std::fs::read_to_string(&expanded)
             .with_context(|| format!("reading value-file {} (for header {:?}) referenced from {}", expanded.display(), entry.name, rules_path.display()))?;
         return Ok(content.trim().to_string());
