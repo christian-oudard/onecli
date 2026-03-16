@@ -48,6 +48,9 @@ struct TomlInjection {
     /// Optional format string — `{value}` is replaced with the resolved value.
     #[serde(default, rename = "value-format")]
     value_format: Option<String>,
+    /// If true, only inject when the request already has this header/param.
+    #[serde(default)]
+    require: bool,
 }
 
 // ── Resolved types ──────────────────────────────────────────────────────
@@ -98,6 +101,7 @@ fn resolve_injections(entries: &[TomlInjection], rules_path: &Path) -> Result<Ve
                 out.push(Injection::SetHeader {
                     name: entry.name.clone(),
                     value,
+                    require: entry.require,
                 });
             }
             "set_query_param" => {
@@ -109,6 +113,7 @@ fn resolve_injections(entries: &[TomlInjection], rules_path: &Path) -> Result<Ve
                 out.push(Injection::SetQueryParam {
                     name: entry.name.clone(),
                     value,
+                    require: entry.require,
                 });
             }
             "remove_header" => {
@@ -244,6 +249,7 @@ mod tests {
                 injections: vec![Injection::SetHeader {
                     name: "x-api-key".to_string(),
                     value: "sk-123".to_string(),
+                    require: false,
                 }],
             }],
         }];
@@ -262,6 +268,7 @@ mod tests {
                 injections: vec![Injection::SetHeader {
                     name: "x-api-key".to_string(),
                     value: "sk-123".to_string(),
+                    require: false,
                 }],
             }],
         }];
@@ -311,7 +318,7 @@ value = "sk-inline-123"
         assert_eq!(rules[0].connect_rules.len(), 1);
         assert_eq!(rules[0].connect_rules[0].path_pattern, "*");
         match &rules[0].connect_rules[0].injections[0] {
-            Injection::SetHeader { name, value } => {
+            Injection::SetHeader { name, value, .. } => {
                 assert_eq!(name, "x-api-key");
                 assert_eq!(value, "sk-inline-123");
             }
@@ -507,7 +514,7 @@ value-file = "{}"
 
         let rules = load(&rules_path).unwrap();
         match &rules[0].connect_rules[0].injections[0] {
-            Injection::SetQueryParam { name, value } => {
+            Injection::SetQueryParam { name, value, .. } => {
                 assert_eq!(name, "api_key");
                 assert_eq!(value, "my-fred-key");
             }

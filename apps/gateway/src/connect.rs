@@ -164,6 +164,7 @@ mod tests {
             crate::inject::Injection::SetHeader {
                 name: "x-api-key".to_string(),
                 value: "sk-ant-123".to_string(),
+                require: false,
             }
         );
         assert_eq!(

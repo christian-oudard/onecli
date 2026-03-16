@@ -17,9 +17,19 @@ use tracing::warn;
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub(crate) enum Injection {
-    SetHeader { name: String, value: String },
+    SetHeader {
+        name: String,
+        value: String,
+        #[serde(default)]
+        require: bool,
+    },
     RemoveHeader { name: String },
-    SetQueryParam { name: String, value: String },
+    SetQueryParam {
+        name: String,
+        value: String,
+        #[serde(default)]
+        require: bool,
+    },
 }
 
 /// A rule matching a path pattern with its injection instructions.
@@ -69,11 +79,14 @@ pub(crate) fn apply_injections(
 
         for injection in &rule.injections {
             match injection {
-                Injection::SetHeader { name, value } => {
+                Injection::SetHeader { name, value, require } => {
                     if let (Ok(header_name), Ok(header_value)) = (
                         HeaderName::from_bytes(name.as_bytes()),
                         HeaderValue::from_str(value),
                     ) {
+                        if *require && !headers.contains_key(&header_name) {
+                            continue;
+                        }
                         headers.insert(header_name, header_value);
                         count += 1;
                     } else {
@@ -104,14 +117,28 @@ pub(crate) fn apply_query_injections(
     path_and_query: &str,
     rules: &[ConnectRule],
 ) -> (String, usize) {
+    // Split path from query string up front (needed for require check)
+    let (path, existing_query) = match path_and_query.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path_and_query, None),
+    };
+
+    // Existing param names for require check
+    let existing_params: std::collections::HashSet<&str> = existing_query
+        .map(|q| q.split('&').filter_map(|pair| pair.split('=').next()).collect())
+        .unwrap_or_default();
+
     // Collect all query param injections that match this path
     let mut params_to_set: Vec<(&str, &str)> = Vec::new();
     for rule in rules {
-        if !path_matches(path_and_query.split('?').next().unwrap_or(path_and_query), &rule.path_pattern) {
+        if !path_matches(path, &rule.path_pattern) {
             continue;
         }
         for injection in &rule.injections {
-            if let Injection::SetQueryParam { name, value } = injection {
+            if let Injection::SetQueryParam { name, value, require } = injection {
+                if *require && !existing_params.contains(name.as_str()) {
+                    continue;
+                }
                 params_to_set.push((name, value));
             }
         }
@@ -123,13 +150,7 @@ pub(crate) fn apply_query_injections(
 
     let count = params_to_set.len();
 
-    // Split into path and existing query
-    let (path, existing_query) = match path_and_query.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (path_and_query, None),
-    };
-
-    // Parse existing params, filtering out any we're about to set
+    // Parse existing params, filtering out any we're about to replace
     let inject_names: std::collections::HashSet<&str> =
         params_to_set.iter().map(|(n, _)| *n).collect();
     let mut parts: Vec<String> = Vec::new();
@@ -309,6 +330,7 @@ mod tests {
         Injection::SetHeader {
             name: name.to_string(),
             value: value.to_string(),
+            require: false,
         }
     }
 
@@ -439,6 +461,7 @@ mod tests {
         Injection::SetQueryParam {
             name: name.to_string(),
             value: value.to_string(),
+            require: false,
         }
     }
 
@@ -513,5 +536,59 @@ mod tests {
         assert_eq!(count, 1);
         assert!(result.contains("api_key=abc"));
         assert!(!result.contains("x-api-key"));
+    }
+
+    // ── require ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn require_header_skips_when_missing() {
+        let mut headers = hyper::HeaderMap::new();
+        let rules = vec![make_rule("*", vec![Injection::SetHeader {
+            name: "x-api-key".to_string(),
+            value: "secret".to_string(),
+            require: true,
+        }])];
+        let count = apply_injections(&mut headers, "/", &rules);
+        assert_eq!(count, 0);
+        assert!(headers.get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn require_header_injects_when_present() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("PLACEHOLDER"));
+        let rules = vec![make_rule("*", vec![Injection::SetHeader {
+            name: "x-api-key".to_string(),
+            value: "real-secret".to_string(),
+            require: true,
+        }])];
+        let count = apply_injections(&mut headers, "/", &rules);
+        assert_eq!(count, 1);
+        assert_eq!(headers.get("x-api-key").unwrap(), "real-secret");
+    }
+
+    #[test]
+    fn require_query_skips_when_missing() {
+        let rules = vec![make_rule("*", vec![Injection::SetQueryParam {
+            name: "api_key".to_string(),
+            value: "secret".to_string(),
+            require: true,
+        }])];
+        let (result, count) = apply_query_injections("/path", &rules);
+        assert_eq!(count, 0);
+        assert_eq!(result, "/path");
+    }
+
+    #[test]
+    fn require_query_injects_when_present() {
+        let rules = vec![make_rule("*", vec![Injection::SetQueryParam {
+            name: "api_key".to_string(),
+            value: "real-secret".to_string(),
+            require: true,
+        }])];
+        let (result, count) = apply_query_injections("/path?api_key=PLACEHOLDER", &rules);
+        assert_eq!(count, 1);
+        assert!(result.contains("api_key=real-secret"));
+        assert!(!result.contains("PLACEHOLDER"));
     }
 }
