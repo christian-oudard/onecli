@@ -29,8 +29,9 @@ struct Cli {
     bind: String,
 
     /// Data directory for CA certificates and persistent state.
-    #[arg(long, default_value = default_data_dir())]
-    data_dir: PathBuf,
+    /// Default: $XDG_DATA_HOME/onecli, falling back to ~/.onecli if it exists.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
 
     /// Local mode: load rules from a TOML file instead of the web API.
     /// No auth tokens needed — rules are resolved entirely from the local file.
@@ -38,8 +39,9 @@ struct Cli {
     local: bool,
 
     /// Path to the local rules TOML file (used with --local).
-    #[arg(long, default_value = default_rules_file())]
-    rules_file: PathBuf,
+    /// Default: $XDG_CONFIG_HOME/onecli/rules.toml, falling back to ~/.onecli/rules.toml.
+    #[arg(long)]
+    rules_file: Option<PathBuf>,
 
     /// OneCLI web API base URL (for credential fetching in API mode).
     #[arg(long, default_value = "http://localhost:10254")]
@@ -48,33 +50,70 @@ struct Cli {
     /// Path to the gateway–API shared secret file.
     /// The secret is used to authenticate credential requests to the web API.
     /// Can also be set via the GATEWAY_SECRET environment variable (takes precedence).
-    #[arg(long, default_value = default_gateway_secret_file())]
-    gateway_secret_file: PathBuf,
+    #[arg(long)]
+    gateway_secret_file: Option<PathBuf>,
 }
 
-fn default_data_dir() -> &'static str {
-    if cfg!(target_os = "linux") && Path::new("/app/data").exists() {
-        "/app/data"
-    } else {
-        "~/.onecli"
+// ── XDG / legacy path resolution ────────────────────────────────────────
+
+/// Resolve the data directory: explicit flag > /app/data (Docker) > XDG > legacy ~/.onecli.
+fn resolve_data_dir(explicit: Option<&Path>) -> PathBuf {
+    if let Some(p) = explicit {
+        return expand_tilde(p);
     }
+    if cfg!(target_os = "linux") && Path::new("/app/data").exists() {
+        return PathBuf::from("/app/data");
+    }
+    let legacy = expand_tilde(Path::new("~/.onecli"));
+    if legacy.is_dir() {
+        return legacy;
+    }
+    xdg_data_home().join("onecli")
 }
 
-fn default_gateway_secret_file() -> &'static str {
-    if cfg!(target_os = "linux") && Path::new("/app/data").exists() {
-        "/app/data/gateway-secret"
-    } else {
-        "~/.onecli/gateway-secret"
+/// Resolve the rules file: explicit flag > /app/data (Docker) > XDG > legacy.
+fn resolve_rules_file(explicit: Option<&Path>) -> PathBuf {
+    if let Some(p) = explicit {
+        return expand_tilde(p);
     }
+    if cfg!(target_os = "linux") && Path::new("/app/data").exists() {
+        return PathBuf::from("/app/data/rules.toml");
+    }
+    let legacy = expand_tilde(Path::new("~/.onecli/rules.toml"));
+    if legacy.is_file() {
+        return legacy;
+    }
+    xdg_config_home().join("onecli").join("rules.toml")
 }
 
-fn default_rules_file() -> &'static str {
-    if cfg!(target_os = "linux") && Path::new("/app/data").exists() {
-        "/app/data/rules.toml"
-    } else {
-        "~/.onecli/rules.toml"
+/// Resolve the gateway secret file: explicit flag > /app/data (Docker) > XDG > legacy.
+fn resolve_gateway_secret_file(explicit: Option<&Path>) -> PathBuf {
+    if let Some(p) = explicit {
+        return expand_tilde(p);
     }
+    if cfg!(target_os = "linux") && Path::new("/app/data").exists() {
+        return PathBuf::from("/app/data/gateway-secret");
+    }
+    let legacy = expand_tilde(Path::new("~/.onecli/gateway-secret"));
+    if legacy.is_file() {
+        return legacy;
+    }
+    xdg_data_home().join("onecli").join("gateway-secret")
 }
+
+fn xdg_data_home() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| expand_tilde(Path::new("~/.local/share")))
+}
+
+fn xdg_config_home() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| expand_tilde(Path::new("~/.config")))
+}
+
+// ── main ────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -92,8 +131,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Expand ~ in data dir
-    let data_dir = expand_tilde(&cli.data_dir);
+    let data_dir = resolve_data_dir(cli.data_dir.as_deref());
 
     info!(data_dir = %data_dir.display(), "starting onecli-gateway");
 
@@ -102,7 +140,7 @@ async fn main() -> Result<()> {
 
     // Build mode
     let mode = if cli.local {
-        let rules_path = expand_tilde(&cli.rules_file);
+        let rules_path = resolve_rules_file(cli.rules_file.as_deref());
         let rules = local::load(&rules_path)?;
         info!(
             rules_file = %rules_path.display(),
@@ -111,7 +149,8 @@ async fn main() -> Result<()> {
         );
         Mode::Local(rules)
     } else {
-        let gateway_secret = load_gateway_secret(&cli.gateway_secret_file);
+        let secret_path = resolve_gateway_secret_file(cli.gateway_secret_file.as_deref());
+        let gateway_secret = load_gateway_secret(&secret_path);
         info!(
             api_url = %cli.api_url,
             gateway_secret_loaded = gateway_secret.is_some(),
@@ -143,22 +182,20 @@ fn load_gateway_secret(secret_file: &Path) -> Option<String> {
         }
     }
 
-    // OSS: read from file
-    let path = expand_tilde(secret_file);
-    match std::fs::read_to_string(&path) {
+    match std::fs::read_to_string(secret_file) {
         Ok(contents) => {
             let secret = contents.trim().to_string();
             if secret.is_empty() {
-                warn!(path = %path.display(), "gateway secret file is empty");
+                warn!(path = %secret_file.display(), "gateway secret file is empty");
                 None
             } else {
-                info!(path = %path.display(), "loaded gateway secret from file");
+                info!(path = %secret_file.display(), "loaded gateway secret from file");
                 Some(secret)
             }
         }
         Err(_) => {
             warn!(
-                path = %path.display(),
+                path = %secret_file.display(),
                 "gateway secret file not found — credential fetching will be unavailable until the web API generates it"
             );
             None

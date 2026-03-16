@@ -156,15 +156,12 @@
         "$@"
     '';
 
-    # Gateway in local mode — reads rules from TOML, no web dashboard needed
+    # Gateway in local mode — reads rules from TOML, no web dashboard needed.
+    # The binary resolves XDG paths itself (falls back to ~/.onecli if it exists).
     gateway-local = pkgs.writeShellScriptBin "onecli-gateway-local" ''
-      DATA_DIR="''${ONECLI_DATA_DIR:-$HOME/.onecli}"
-      mkdir -p "$DATA_DIR"
-
       exec ${gateway}/bin/onecli-gateway \
         --local \
         --port "''${GATEWAY_PORT:-10255}" \
-        --data-dir "$DATA_DIR" \
         "$@"
     '';
 
