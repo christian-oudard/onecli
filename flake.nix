@@ -156,19 +156,17 @@
         "$@"
     '';
 
-    # Gateway in local mode — reads rules from TOML, no web dashboard needed.
+    # Standalone gateway runner (no web dashboard).
     # The binary resolves XDG paths itself (falls back to ~/.onecli if it exists).
-    gateway-local = pkgs.writeShellScriptBin "onecli-gateway-local" ''
-      exec ${gateway}/bin/onecli-gateway \
-        --local \
-        "$@"
+    gateway-standalone = pkgs.writeShellScriptBin "onecli-gateway" ''
+      exec ${gateway}/bin/onecli-gateway "$@"
     '';
 
   in {
     packages.${system} = {
       inherit gateway web;
       gateway-runner = gateway-runner;
-      gateway-local = gateway-local;
+      gateway-standalone = gateway-standalone;
       default = entrypoint;
     };
 
