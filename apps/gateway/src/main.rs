@@ -139,33 +139,33 @@ async fn main() -> Result<()> {
     let ca = CertificateAuthority::load_or_generate(&data_dir).await?;
 
     // Build mode
-    let mode = if cli.local {
+    let (mode, rules_path) = if cli.local {
         let rules_path = resolve_rules_file(cli.rules_file.as_deref());
         let rules = local::load(&rules_path)?;
         info!(
             rules_file = %rules_path.display(),
             rule_count = rules.len(),
-            "local mode: loaded rules"
+            "local mode: loaded rules (send SIGHUP to reload)"
         );
-        Mode::Local(rules)
+        (Mode::Local(std::sync::RwLock::new(rules)), Some(rules_path))
     } else {
         let secret_path = resolve_gateway_secret_file(cli.gateway_secret_file.as_deref());
         let gateway_secret = load_gateway_secret(&secret_path);
         info!(
             api_url = %cli.api_url,
             gateway_secret_loaded = gateway_secret.is_some(),
-            "API mode"
+            "API mode (send SIGHUP to clear cache)"
         );
-        Mode::Api {
+        (Mode::Api {
             api_url: cli.api_url.into(),
             gateway_secret: gateway_secret.map(|s| s.into()),
-        }
+        }, None)
     };
 
     info!(port = cli.port, bind = %cli.bind, "gateway ready");
 
     // Start the gateway server (blocks forever)
-    let server = GatewayServer::new(ca, cli.port, cli.bind, mode);
+    let server = GatewayServer::new(ca, cli.port, cli.bind, mode, rules_path);
     server.run().await
 }
 

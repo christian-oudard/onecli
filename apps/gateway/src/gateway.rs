@@ -4,6 +4,7 @@
 //! accept → authenticate → resolve (via [`connect`]) → MITM or tunnel.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -36,7 +37,8 @@ pub(crate) enum Mode {
         gateway_secret: Option<Arc<str>>,
     },
     /// Load rules from a local TOML file (single-user, no auth).
-    Local(Vec<ResolvedLocalRule>),
+    /// Rules are behind RwLock for SIGHUP reload.
+    Local(std::sync::RwLock<Vec<ResolvedLocalRule>>),
 }
 
 // ── GatewayServer ───────────────────────────────────────────────────────
@@ -47,6 +49,8 @@ pub struct GatewayServer {
     port: u16,
     bind_addr: String,
     mode: Arc<Mode>,
+    /// Path to the local rules TOML file (for SIGHUP reload in local mode).
+    rules_path: Option<PathBuf>,
     /// Cache of resolved connect responses per (agent_token, host) — API mode only.
     connect_cache: Arc<DashMap<ConnectCacheKey, CachedConnect>>,
 }
@@ -57,6 +61,7 @@ impl GatewayServer {
         port: u16,
         bind_addr: String,
         mode: Mode,
+        rules_path: Option<PathBuf>,
     ) -> Self {
         Self {
             ca: Arc::new(ca),
@@ -69,11 +74,13 @@ impl GatewayServer {
             port,
             bind_addr,
             mode: Arc::new(mode),
+            rules_path,
             connect_cache: Arc::new(DashMap::new()),
         }
     }
 
     /// Start the gateway TCP listener. Runs forever.
+    /// Handles SIGHUP to reload rules (local mode) or clear cache (API mode).
     pub async fn run(&self) -> Result<()> {
         let addr: SocketAddr = format!("{}:{}", self.bind_addr, self.port)
             .parse()
@@ -84,27 +91,77 @@ impl GatewayServer {
 
         info!(addr = %addr, "listening for connections");
 
-        loop {
-            let (stream, peer_addr) = listener.accept().await?;
-            let ca = Arc::clone(&self.ca);
-            let http_client = self.http_client.clone();
-            let mode = Arc::clone(&self.mode);
-            let connect_cache = Arc::clone(&self.connect_cache);
+        #[cfg(unix)]
+        let mut sighup = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::hangup(),
+        ).context("registering SIGHUP handler")?;
 
-            tokio::spawn(async move {
-                if let Err(e) = handle_connection(
-                    stream,
-                    peer_addr,
-                    ca,
-                    http_client,
-                    mode,
-                    connect_cache,
-                )
-                .await
-                {
-                    warn!(peer = %peer_addr, error = %e, "connection error");
+        loop {
+            #[cfg(unix)]
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, peer_addr) = result?;
+                    self.spawn_connection(stream, peer_addr);
                 }
-            });
+                _ = sighup.recv() => {
+                    self.handle_sighup();
+                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                let (stream, peer_addr) = listener.accept().await?;
+                self.spawn_connection(stream, peer_addr);
+            }
+        }
+    }
+
+    fn spawn_connection(&self, stream: TcpStream, peer_addr: SocketAddr) {
+        let ca = Arc::clone(&self.ca);
+        let http_client = self.http_client.clone();
+        let mode = Arc::clone(&self.mode);
+        let connect_cache = Arc::clone(&self.connect_cache);
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(
+                stream,
+                peer_addr,
+                ca,
+                http_client,
+                mode,
+                connect_cache,
+            )
+            .await
+            {
+                warn!(peer = %peer_addr, error = %e, "connection error");
+            }
+        });
+    }
+
+    fn handle_sighup(&self) {
+        match self.mode.as_ref() {
+            Mode::Local(rules_lock) => {
+                if let Some(ref path) = self.rules_path {
+                    match crate::local::load(path) {
+                        Ok(new_rules) => {
+                            let count = new_rules.len();
+                            *rules_lock.write().unwrap() = new_rules;
+                            info!(
+                                rules_file = %path.display(),
+                                rule_count = count,
+                                "SIGHUP: reloaded rules"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "SIGHUP: failed to reload rules, keeping old rules");
+                        }
+                    }
+                }
+            }
+            Mode::Api { .. } => {
+                self.connect_cache.clear();
+                info!("SIGHUP: cleared API response cache");
+            }
         }
     }
 }
@@ -170,9 +227,10 @@ async fn handle_request(
         let hostname = strip_port(&host).to_string();
 
         let (intercept, rules) = match mode.as_ref() {
-            Mode::Local(local_rules) => {
+            Mode::Local(rules_lock) => {
                 // Local mode: match hostname against TOML rules, no auth needed
-                crate::local::resolve(&hostname, local_rules)
+                let local_rules = rules_lock.read().unwrap();
+                crate::local::resolve(&hostname, &local_rules)
             }
             Mode::Api {
                 api_url,
