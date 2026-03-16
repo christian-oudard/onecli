@@ -45,9 +45,16 @@ struct TomlInjection {
     /// Path to a file containing the value (read at startup).
     #[serde(default, rename = "value-file")]
     value_file: Option<String>,
+    /// Dot-notation path to extract a string from a JSON `value-file`.
+    /// E.g. `"token.access_token"` navigates `{"token":{"access_token":"..."}}`.
+    #[serde(default, rename = "json-path")]
+    json_path: Option<String>,
     /// Optional format string — `{value}` is replaced with the resolved value.
     #[serde(default, rename = "value-format")]
     value_format: Option<String>,
+    /// Simple prefix prepended to the resolved value (convenience for `Bearer ` etc.).
+    #[serde(default, rename = "value-prefix")]
+    value_prefix: Option<String>,
     /// If true, only inject when the request already has this header/param.
     #[serde(default)]
     require: bool,
@@ -94,10 +101,7 @@ fn resolve_injections(entries: &[TomlInjection], rules_path: &Path) -> Result<Ve
         match entry.action.as_str() {
             "set_header" => {
                 let raw_value = resolve_value(entry, rules_path)?;
-                let value = match &entry.value_format {
-                    Some(fmt) => fmt.replace("{value}", &raw_value),
-                    None => raw_value,
-                };
+                let value = format_value(&raw_value, &entry.value_format, &entry.value_prefix);
                 out.push(Injection::SetHeader {
                     name: entry.name.clone(),
                     value,
@@ -106,10 +110,7 @@ fn resolve_injections(entries: &[TomlInjection], rules_path: &Path) -> Result<Ve
             }
             "set_query_param" => {
                 let raw_value = resolve_value(entry, rules_path)?;
-                let value = match &entry.value_format {
-                    Some(fmt) => fmt.replace("{value}", &raw_value),
-                    None => raw_value,
-                };
+                let value = format_value(&raw_value, &entry.value_format, &entry.value_prefix);
                 out.push(Injection::SetQueryParam {
                     name: entry.name.clone(),
                     value,
@@ -127,7 +128,23 @@ fn resolve_injections(entries: &[TomlInjection], rules_path: &Path) -> Result<Ve
     Ok(out)
 }
 
-/// Resolve the value for a set_header injection: inline `value` or `value-file`.
+/// Apply `value-format` and/or `value-prefix` to the resolved raw value.
+fn format_value(
+    raw: &str,
+    value_format: &Option<String>,
+    value_prefix: &Option<String>,
+) -> String {
+    let formatted = match value_format {
+        Some(fmt) => fmt.replace("{value}", raw),
+        None => raw.to_string(),
+    };
+    match value_prefix {
+        Some(prefix) => format!("{prefix}{formatted}"),
+        None => formatted,
+    }
+}
+
+/// Resolve the value for a set_header injection: inline `value` or `value-file` (with optional `json-path`).
 fn resolve_value(entry: &TomlInjection, rules_path: &Path) -> Result<String> {
     if let Some(ref v) = entry.value {
         return Ok(v.clone());
@@ -142,13 +159,25 @@ fn resolve_value(entry: &TomlInjection, rules_path: &Path) -> Result<String> {
                     tracing::warn!(
                         path = %expanded.display(),
                         mode = format!("{:o}", meta.mode() & 0o777),
-                        "secret file has group/world permissions — consider chmod 600"
+                        "secret file has group/world permissions, consider chmod 600"
                     );
                 }
             }
         }
         let content = std::fs::read_to_string(&expanded)
             .with_context(|| format!("reading value-file {} (for header {:?}) referenced from {}", expanded.display(), entry.name, rules_path.display()))?;
+
+        if let Some(ref json_path) = entry.json_path {
+            return extract_json_path(&content, json_path).with_context(|| {
+                format!(
+                    "extracting json-path {:?} from {} (for header {:?})",
+                    json_path,
+                    expanded.display(),
+                    entry.name
+                )
+            });
+        }
+
         return Ok(content.trim().to_string());
     }
     bail!(
@@ -156,6 +185,22 @@ fn resolve_value(entry: &TomlInjection, rules_path: &Path) -> Result<String> {
         entry.name,
         rules_path.display()
     );
+}
+
+/// Walk a dot-separated path through a JSON value, returning the leaf as a string.
+fn extract_json_path(content: &str, path: &str) -> Result<String> {
+    let root: serde_json::Value =
+        serde_json::from_str(content).context("value-file is not valid JSON")?;
+    let mut current = &root;
+    for key in path.split('.') {
+        current = current
+            .get(key)
+            .with_context(|| format!("key {:?} not found (full path: {:?})", key, path))?;
+    }
+    match current {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        other => Ok(other.to_string()),
+    }
 }
 
 // ── Runtime resolution ──────────────────────────────────────────────────
@@ -519,6 +564,192 @@ value-file = "{}"
                 assert_eq!(value, "my-fred-key");
             }
             other => panic!("expected SetQueryParam, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_json_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("token.json");
+        std::fs::write(
+            &json_path,
+            r#"{"token": {"access_token": "I0.abc123", "expires_in": 1800}}"#,
+        )
+        .unwrap();
+
+        let rules_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            format!(
+                r#"
+[[rules]]
+host = "api.schwabapi.com"
+[[rules.inject]]
+action = "set_header"
+name = "Authorization"
+value-file = "{}"
+json-path = "token.access_token"
+value-prefix = "Bearer "
+require = true
+"#,
+                json_path.display()
+            ),
+        )
+        .unwrap();
+
+        let rules = load(&rules_path).unwrap();
+        match &rules[0].connect_rules[0].injections[0] {
+            Injection::SetHeader { name, value, require } => {
+                assert_eq!(name, "Authorization");
+                assert_eq!(value, "Bearer I0.abc123");
+                assert!(*require);
+            }
+            other => panic!("expected SetHeader, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_json_path_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("deep.json");
+        std::fs::write(&json_path, r#"{"a": {"b": {"c": "deep-value"}}}"#).unwrap();
+
+        let rules_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            format!(
+                r#"
+[[rules]]
+host = "example.com"
+[[rules.inject]]
+action = "set_header"
+name = "x-token"
+value-file = "{}"
+json-path = "a.b.c"
+"#,
+                json_path.display()
+            ),
+        )
+        .unwrap();
+
+        let rules = load(&rules_path).unwrap();
+        match &rules[0].connect_rules[0].injections[0] {
+            Injection::SetHeader { value, .. } => assert_eq!(value, "deep-value"),
+            other => panic!("expected SetHeader, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_json_path_bad_key_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("token.json");
+        std::fs::write(&json_path, r#"{"token": {"refresh_token": "x"}}"#).unwrap();
+
+        let rules_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            format!(
+                r#"
+[[rules]]
+host = "example.com"
+[[rules.inject]]
+action = "set_header"
+name = "Authorization"
+value-file = "{}"
+json-path = "token.access_token"
+"#,
+                json_path.display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&rules_path).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("access_token"), "should mention missing key: {msg}");
+    }
+
+    #[test]
+    fn load_json_path_invalid_json_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("bad.json");
+        std::fs::write(&json_path, "not json at all").unwrap();
+
+        let rules_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            format!(
+                r#"
+[[rules]]
+host = "example.com"
+[[rules.inject]]
+action = "set_header"
+name = "x-token"
+value-file = "{}"
+json-path = "key"
+"#,
+                json_path.display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&rules_path).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("not valid JSON"), "should say invalid JSON: {msg}");
+    }
+
+    #[test]
+    fn load_json_path_numeric_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("data.json");
+        std::fs::write(&json_path, r#"{"expires_in": 1800}"#).unwrap();
+
+        let rules_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            format!(
+                r#"
+[[rules]]
+host = "example.com"
+[[rules.inject]]
+action = "set_header"
+name = "x-expires"
+value-file = "{}"
+json-path = "expires_in"
+"#,
+                json_path.display()
+            ),
+        )
+        .unwrap();
+
+        let rules = load(&rules_path).unwrap();
+        match &rules[0].connect_rules[0].injections[0] {
+            Injection::SetHeader { value, .. } => assert_eq!(value, "1800"),
+            other => panic!("expected SetHeader, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_value_prefix_with_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            r#"
+[[rules]]
+host = "example.com"
+[[rules.inject]]
+action = "set_header"
+name = "Authorization"
+value = "my-token"
+value-prefix = "Bearer "
+"#,
+        )
+        .unwrap();
+
+        let rules = load(&rules_path).unwrap();
+        match &rules[0].connect_rules[0].injections[0] {
+            Injection::SetHeader { value, .. } => assert_eq!(value, "Bearer my-token"),
+            other => panic!("expected SetHeader, got {:?}", other),
         }
     }
 
