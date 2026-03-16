@@ -1,8 +1,8 @@
-//! Header injection and agent authentication.
+//! Request injection and agent authentication.
 //!
 //! This module handles:
 //! - Extracting agent tokens from `Proxy-Authorization` headers
-//! - Applying injection rules (set_header, remove_header) to forwarded requests
+//! - Applying injection rules (set_header, remove_header, set_query_param) to forwarded requests
 //! - Path pattern matching for injection rules
 
 use base64::Engine;
@@ -19,6 +19,7 @@ use tracing::warn;
 pub(crate) enum Injection {
     SetHeader { name: String, value: String },
     RemoveHeader { name: String },
+    SetQueryParam { name: String, value: String },
 }
 
 /// A rule matching a path pattern with its injection instructions.
@@ -89,11 +90,86 @@ pub(crate) fn apply_injections(
                         }
                     }
                 }
+                Injection::SetQueryParam { .. } => {} // handled by apply_query_injections
             }
         }
     }
 
     count
+}
+
+/// Apply query parameter injections to a URL path+query string.
+/// Returns the modified path+query and the number of injections applied.
+pub(crate) fn apply_query_injections(
+    path_and_query: &str,
+    rules: &[ConnectRule],
+) -> (String, usize) {
+    // Collect all query param injections that match this path
+    let mut params_to_set: Vec<(&str, &str)> = Vec::new();
+    for rule in rules {
+        if !path_matches(path_and_query.split('?').next().unwrap_or(path_and_query), &rule.path_pattern) {
+            continue;
+        }
+        for injection in &rule.injections {
+            if let Injection::SetQueryParam { name, value } = injection {
+                params_to_set.push((name, value));
+            }
+        }
+    }
+
+    if params_to_set.is_empty() {
+        return (path_and_query.to_string(), 0);
+    }
+
+    let count = params_to_set.len();
+
+    // Split into path and existing query
+    let (path, existing_query) = match path_and_query.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path_and_query, None),
+    };
+
+    // Parse existing params, filtering out any we're about to set
+    let inject_names: std::collections::HashSet<&str> =
+        params_to_set.iter().map(|(n, _)| *n).collect();
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(q) = existing_query {
+        for pair in q.split('&') {
+            let name = pair.split('=').next().unwrap_or(pair);
+            if !inject_names.contains(name) {
+                parts.push(pair.to_string());
+            }
+        }
+    }
+
+    // Append injected params
+    for (name, value) in &params_to_set {
+        parts.push(format!(
+            "{}={}",
+            percent_encode(name),
+            percent_encode(value)
+        ));
+    }
+
+    (format!("{}?{}", path, parts.join("&")), count)
+}
+
+/// Percent-encode a query parameter name or value.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(char::from(b"0123456789ABCDEF"[(b >> 4) as usize]));
+                out.push(char::from(b"0123456789ABCDEF"[(b & 0xf) as usize]));
+            }
+        }
+    }
+    out
 }
 
 /// Check if a request path matches a rule's path pattern.
@@ -355,5 +431,87 @@ mod tests {
 
         let count = apply_injections(&mut headers, "/anything", &[]);
         assert_eq!(count, 0);
+    }
+
+    // ── apply_query_injections ──────────────────────────────────────────
+
+    fn set_query_param(name: &str, value: &str) -> Injection {
+        Injection::SetQueryParam {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn query_inject_adds_param() {
+        let rules = vec![make_rule("*", vec![set_query_param("api_key", "abc123")])];
+        let (result, count) = apply_query_injections("/fred/series", &rules);
+        assert_eq!(count, 1);
+        assert_eq!(result, "/fred/series?api_key=abc123");
+    }
+
+    #[test]
+    fn query_inject_preserves_existing_params() {
+        let rules = vec![make_rule("*", vec![set_query_param("api_key", "abc123")])];
+        let (result, count) = apply_query_injections("/fred/series?series_id=GDP", &rules);
+        assert_eq!(count, 1);
+        assert!(result.contains("series_id=GDP"));
+        assert!(result.contains("api_key=abc123"));
+    }
+
+    #[test]
+    fn query_inject_replaces_existing_param() {
+        let rules = vec![make_rule("*", vec![set_query_param("api_key", "new")])];
+        let (result, count) = apply_query_injections("/path?api_key=old&other=1", &rules);
+        assert_eq!(count, 1);
+        assert!(result.contains("api_key=new"));
+        assert!(!result.contains("api_key=old"));
+        assert!(result.contains("other=1"));
+    }
+
+    #[test]
+    fn query_inject_no_match_returns_unchanged() {
+        let rules = vec![make_rule("/v1/*", vec![set_query_param("key", "val")])];
+        let (result, count) = apply_query_injections("/v2/foo", &rules);
+        assert_eq!(count, 0);
+        assert_eq!(result, "/v2/foo");
+    }
+
+    #[test]
+    fn query_inject_encodes_special_chars() {
+        let rules = vec![make_rule("*", vec![set_query_param("q", "hello world&more")])];
+        let (result, _) = apply_query_injections("/search", &rules);
+        assert!(result.contains("q=hello%20world%26more"));
+    }
+
+    #[test]
+    fn query_inject_multiple_params() {
+        let rules = vec![make_rule(
+            "*",
+            vec![
+                set_query_param("api_key", "abc"),
+                set_query_param("file_type", "json"),
+            ],
+        )];
+        let (result, count) = apply_query_injections("/fred/series", &rules);
+        assert_eq!(count, 2);
+        assert!(result.contains("api_key=abc"));
+        assert!(result.contains("file_type=json"));
+    }
+
+    #[test]
+    fn query_inject_skips_header_injections() {
+        // apply_query_injections should only act on SetQueryParam, not SetHeader
+        let rules = vec![make_rule(
+            "*",
+            vec![
+                set_header("x-api-key", "secret"),
+                set_query_param("api_key", "abc"),
+            ],
+        )];
+        let (result, count) = apply_query_injections("/path", &rules);
+        assert_eq!(count, 1);
+        assert!(result.contains("api_key=abc"));
+        assert!(!result.contains("x-api-key"));
     }
 }

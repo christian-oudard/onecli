@@ -319,7 +319,6 @@ async fn forward_request(
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
-    let url = format!("https://{host}{path}");
 
     let (parts, body) = req.into_parts();
 
@@ -332,7 +331,10 @@ async fn forward_request(
     }
 
     // Apply injection rules matching this request path
-    let injection_count = inject::apply_injections(&mut headers, &path, rules);
+    let header_count = inject::apply_injections(&mut headers, &path, rules);
+    let (injected_path, query_count) = inject::apply_query_injections(&path, rules);
+    let injection_count = header_count + query_count;
+    let url = format!("https://{host}{injected_path}");
 
     // Build upstream request with (possibly modified) headers
     let mut upstream = http_client.request(method.clone(), &url);

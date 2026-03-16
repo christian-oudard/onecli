@@ -100,6 +100,17 @@ fn resolve_injections(entries: &[TomlInjection], rules_path: &Path) -> Result<Ve
                     value,
                 });
             }
+            "set_query_param" => {
+                let raw_value = resolve_value(entry, rules_path)?;
+                let value = match &entry.value_format {
+                    Some(fmt) => fmt.replace("{value}", &raw_value),
+                    None => raw_value,
+                };
+                out.push(Injection::SetQueryParam {
+                    name: entry.name.clone(),
+                    value,
+                });
+            }
             "remove_header" => {
                 out.push(Injection::RemoveHeader {
                     name: entry.name.clone(),
@@ -456,6 +467,39 @@ name = "x-api-key"
             format!("{err:?}").contains("neither"),
             "error should say no value source: {err:?}"
         );
+    }
+
+    #[test]
+    fn load_set_query_param() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("fred.key");
+        std::fs::write(&secret_path, "my-fred-key\n").unwrap();
+
+        let rules_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            format!(
+                r#"
+[[rules]]
+host = "api.stlouisfed.org"
+[[rules.inject]]
+action = "set_query_param"
+name = "api_key"
+value-file = "{}"
+"#,
+                secret_path.display()
+            ),
+        )
+        .unwrap();
+
+        let rules = load(&rules_path).unwrap();
+        match &rules[0].connect_rules[0].injections[0] {
+            Injection::SetQueryParam { name, value } => {
+                assert_eq!(name, "api_key");
+                assert_eq!(value, "my-fred-key");
+            }
+            other => panic!("expected SetQueryParam, got {:?}", other),
+        }
     }
 
     #[test]
