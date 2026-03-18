@@ -45,8 +45,12 @@ struct TomlInjection {
     /// Path to a file containing the value (read at startup).
     #[serde(default, rename = "value-file")]
     value_file: Option<String>,
-    /// Dot-notation path to extract a string from a JSON `value-file`.
-    /// E.g. `"token.access_token"` navigates `{"token":{"access_token":"..."}}`.
+    /// Dot-notation path to extract a value from a structured `value-file`.
+    /// Format auto-detected from file extension (.json or .toml).
+    /// E.g. `"christian-oudard.token_id"` navigates `[christian-oudard] token_id = "..."`.
+    #[serde(default, rename = "value-path")]
+    value_path: Option<String>,
+    /// Legacy alias for `value-path` (JSON files only).
     #[serde(default, rename = "json-path")]
     json_path: Option<String>,
     /// Optional format string — `{value}` is replaced with the resolved value.
@@ -167,11 +171,23 @@ fn resolve_value(entry: &TomlInjection, rules_path: &Path) -> Result<String> {
         let content = std::fs::read_to_string(&expanded)
             .with_context(|| format!("reading value-file {} (for header {:?}) referenced from {}", expanded.display(), entry.name, rules_path.display()))?;
 
+        // json-path is a legacy alias for value-path (JSON only)
         if let Some(ref json_path) = entry.json_path {
             return extract_json_path(&content, json_path).with_context(|| {
                 format!(
                     "extracting json-path {:?} from {} (for header {:?})",
                     json_path,
+                    expanded.display(),
+                    entry.name
+                )
+            });
+        }
+
+        if let Some(ref vpath) = entry.value_path {
+            return extract_value_path(&content, vpath, &expanded).with_context(|| {
+                format!(
+                    "extracting value-path {:?} from {} (for header {:?})",
+                    vpath,
                     expanded.display(),
                     entry.name
                 )
@@ -199,6 +215,31 @@ fn extract_json_path(content: &str, path: &str) -> Result<String> {
     }
     match current {
         serde_json::Value::String(s) => Ok(s.clone()),
+        other => Ok(other.to_string()),
+    }
+}
+
+/// Auto-detect format from file extension and extract a dot-separated path.
+fn extract_value_path(content: &str, path: &str, file: &Path) -> Result<String> {
+    match file.extension().and_then(|e| e.to_str()) {
+        Some("json") => extract_json_path(content, path),
+        Some("toml") => extract_toml_path(content, path),
+        Some(ext) => bail!("unsupported value-file extension {:?}, expected .json or .toml", ext),
+        None => bail!("value-file has no extension, cannot determine format for value-path"),
+    }
+}
+
+/// Walk a dot-separated path through a TOML value, returning the leaf as a string.
+fn extract_toml_path(content: &str, path: &str) -> Result<String> {
+    let root: toml::Value = content.parse().context("value-file is not valid TOML")?;
+    let mut current = &root;
+    for key in path.split('.') {
+        current = current
+            .get(key)
+            .with_context(|| format!("key {:?} not found (full path: {:?})", key, path))?;
+    }
+    match current {
+        toml::Value::String(s) => Ok(s.clone()),
         other => Ok(other.to_string()),
     }
 }
@@ -606,6 +647,129 @@ require = true
             }
             other => panic!("expected SetHeader, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn load_value_path_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_file = dir.path().join("modal.toml");
+        std::fs::write(
+            &toml_file,
+            r#"
+[christian-oudard]
+token_id = "ak-oDO-test123"
+token_secret = "as-PsX-test456"
+active = true
+"#,
+        )
+        .unwrap();
+
+        let rules_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            format!(
+                r#"
+[[rules]]
+host = "api.modal.com"
+[[rules.inject]]
+action = "set_header"
+name = "x-modal-token-id"
+value-file = "{0}"
+value-path = "christian-oudard.token_id"
+[[rules.inject]]
+action = "set_header"
+name = "x-modal-token-secret"
+value-file = "{0}"
+value-path = "christian-oudard.token_secret"
+"#,
+                toml_file.display()
+            ),
+        )
+        .unwrap();
+
+        let rules = load(&rules_path).unwrap();
+        assert_eq!(rules[0].host_pattern, "api.modal.com");
+        let injections = &rules[0].connect_rules[0].injections;
+        assert_eq!(injections.len(), 2);
+        match &injections[0] {
+            Injection::SetHeader { name, value, .. } => {
+                assert_eq!(name, "x-modal-token-id");
+                assert_eq!(value, "ak-oDO-test123");
+            }
+            other => panic!("expected SetHeader, got {:?}", other),
+        }
+        match &injections[1] {
+            Injection::SetHeader { name, value, .. } => {
+                assert_eq!(name, "x-modal-token-secret");
+                assert_eq!(value, "as-PsX-test456");
+            }
+            other => panic!("expected SetHeader, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_value_path_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_file = dir.path().join("creds.json");
+        std::fs::write(
+            &json_file,
+            r#"{"token": {"access_token": "abc123"}}"#,
+        )
+        .unwrap();
+
+        let rules_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            format!(
+                r#"
+[[rules]]
+host = "example.com"
+[[rules.inject]]
+action = "set_header"
+name = "Authorization"
+value-file = "{}"
+value-path = "token.access_token"
+value-prefix = "Bearer "
+"#,
+                json_file.display()
+            ),
+        )
+        .unwrap();
+
+        let rules = load(&rules_path).unwrap();
+        match &rules[0].connect_rules[0].injections[0] {
+            Injection::SetHeader { value, .. } => assert_eq!(value, "Bearer abc123"),
+            other => panic!("expected SetHeader, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_value_path_unknown_extension_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("creds.yaml");
+        std::fs::write(&file, "key: value").unwrap();
+
+        let rules_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            format!(
+                r#"
+[[rules]]
+host = "example.com"
+[[rules.inject]]
+action = "set_header"
+name = "x-token"
+value-file = "{}"
+value-path = "key"
+"#,
+                file.display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&rules_path).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unsupported"), "should say unsupported: {msg}");
     }
 
     #[test]
