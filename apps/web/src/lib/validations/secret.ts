@@ -2,10 +2,8 @@ import { z } from "zod";
 
 const injectionConfigSchema = z
   .object({
-    headerName: z.string().min(1).optional(),
+    headerName: z.string().min(1),
     valueFormat: z.string().optional(),
-    clientId: z.string().optional(),
-    clientSecret: z.string().optional(),
   })
   .nullable()
   .optional();
@@ -26,28 +24,20 @@ const hostPatternSchema = z
     message: "Host pattern must not contain spaces",
   });
 
-export const createSecretSchema = z
-  .object({
-    name: z.string().trim().min(1).max(255),
-    type: z.enum(["anthropic", "generic", "google_oauth"]),
-    value: z.string().min(1).max(10000),
-    hostPattern: hostPatternSchema,
-    pathPattern: z.string().max(1000).optional(),
-    injectionConfig: injectionConfigSchema,
-  })
-  .refine(
-    (data) =>
-      data.type !== "generic" || !!data.injectionConfig?.headerName?.trim(),
-    {
-      message: "Header name is required for generic secrets",
-      path: ["injectionConfig", "headerName"],
-    },
-  );
+export const createSecretSchema = z.object({
+  name: z.string().trim().min(1).max(255),
+  type: z.enum(["anthropic", "generic"]),
+  value: z.string().min(1).max(10000),
+  hostPattern: hostPatternSchema,
+  pathPattern: z.string().max(1000).optional(),
+  injectionConfig: injectionConfigSchema,
+});
 
 export type CreateSecretInput = z.infer<typeof createSecretSchema>;
 
 export const updateSecretSchema = z
   .object({
+    name: z.string().trim().min(1).max(255).optional(),
     value: z.string().min(1).max(10000).optional(),
     hostPattern: hostPatternSchema.optional(),
     pathPattern: z.string().max(1000).nullable().optional(),
