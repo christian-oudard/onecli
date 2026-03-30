@@ -6,6 +6,7 @@ import {
   getAgentSecrets,
   updateAgentSecrets,
 } from "@/lib/services/agent-service";
+import { notifyGateway } from "@/lib/services/gateway-service";
 import { updateAgentSecretsSchema } from "@/lib/validations/agent";
 
 type Params = { params: Promise<{ agentId: string }> };
@@ -40,6 +41,7 @@ export const PUT = async (request: NextRequest, { params }: Params) => {
 
     await updateAgentSecrets(auth.accountId, agentId, parsed.data.secretIds);
     invalidateGatewayCache(request);
+    void notifyGateway(auth.accountId);
     return NextResponse.json({ success: true });
   } catch (err) {
     return handleServiceError(err);

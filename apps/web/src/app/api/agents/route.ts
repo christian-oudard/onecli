@@ -3,6 +3,7 @@ import { resolveApiAuth } from "@/lib/api-auth";
 import { handleServiceError, unauthorized } from "@/lib/api-utils";
 import { invalidateGatewayCache } from "@/lib/gateway-invalidate";
 import { listAgents, createAgent } from "@/lib/services/agent-service";
+import { notifyGateway } from "@/lib/services/gateway-service";
 import { createAgentSchema } from "@/lib/validations/agent";
 
 export const GET = async (request: NextRequest) => {
@@ -37,6 +38,7 @@ export const POST = async (request: NextRequest) => {
       parsed.data.identifier,
     );
     invalidateGatewayCache(request);
+    void notifyGateway(auth.accountId);
     return NextResponse.json(agent, { status: 201 });
   } catch (err) {
     return handleServiceError(err);

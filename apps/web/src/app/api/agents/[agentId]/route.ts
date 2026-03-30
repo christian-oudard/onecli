@@ -3,6 +3,7 @@ import { resolveApiAuth } from "@/lib/api-auth";
 import { handleServiceError, unauthorized } from "@/lib/api-utils";
 import { invalidateGatewayCache } from "@/lib/gateway-invalidate";
 import { renameAgent, deleteAgent } from "@/lib/services/agent-service";
+import { notifyGateway } from "@/lib/services/gateway-service";
 import { renameAgentSchema } from "@/lib/validations/agent";
 
 type Params = { params: Promise<{ agentId: string }> };
@@ -23,6 +24,7 @@ export const PATCH = async (request: NextRequest, { params }: Params) => {
     }
 
     await renameAgent(auth.accountId, agentId, parsed.data.name);
+    void notifyGateway(auth.accountId);
     return NextResponse.json({ success: true });
   } catch (err) {
     return handleServiceError(err);
@@ -37,6 +39,7 @@ export const DELETE = async (request: NextRequest, { params }: Params) => {
     const { agentId } = await params;
     await deleteAgent(auth.accountId, agentId);
     invalidateGatewayCache(request);
+    void notifyGateway(auth.accountId);
     return new NextResponse(null, { status: 204 });
   } catch (err) {
     return handleServiceError(err);

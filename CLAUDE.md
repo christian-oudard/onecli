@@ -25,6 +25,33 @@ packages/eslint-config/
 packages/typescript-config/
 ```
 
+## Gateway
+
+The MITM proxy that intercepts agent HTTP traffic and injects credentials. Lives in `apps/gateway/` (Rust).
+
+```bash
+cargo run -p onecli-gateway -- [flags]
+```
+
+**CLI flags:**
+
+- `--bind <addr>` - Listen address (default: `127.0.0.1`, not `0.0.0.0`)
+- `--port <port>` - Listen port (default: `10255`)
+- `--rules <path>` - Path to rules JSON config file
+- `--data-dir <path>` - CA certificates and persistent state (default: `~/.onecli`)
+- `--no-control-socket` - Disable the Unix domain control socket
+- `--allow-public-anonymous` - Allow anonymous agents on non-loopback addresses
+
+**Rules file resolution:** `--rules` flag > `/etc/onecli/rules.json` (root) > `~/.config/onecli/rules.json` (non-root). See `apps/gateway/rules.json.example` for the config format.
+
+**Security:** Anonymous agents (`"token": null`) are rejected when bound to a non-loopback address unless `--allow-public-anonymous` is passed. This check runs at startup, on SIGHUP reload, and on control socket push.
+
+**SIGHUP** reloads the rules file from disk.
+
+**Control socket:** Unix domain socket at `$XDG_RUNTIME_DIR/onecli/control.sock`. Accepts `POST /rules` with the same JSON format as `rules.json`. The web UI uses this to push config changes. Disable with `--no-control-socket`.
+
+**Database:** The gateway never requires PostgreSQL. When `DATABASE_URL` is set, legacy vault secret injection is available. Without it, the gateway runs fully standalone using only the rules file, control socket, and SQLite token state.
+
 ## Environment Variables
 
 - `DATABASE_URL`: PostgreSQL connection string

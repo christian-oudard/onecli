@@ -78,18 +78,21 @@ impl FromRequestParts<GatewayState> for AuthUser {
         parts: &mut Parts,
         state: &GatewayState,
     ) -> Result<Self, Self::Rejection> {
+        let pool = state.db_pool.as_ref().ok_or_else(|| {
+            warn!("auth: no database connection (standalone mode)");
+            AuthError("not available in standalone mode".to_string())
+        })?;
+
         // Try API key auth first (Authorization: Bearer oc_...)
-        if let Some(api_key_user) =
-            validate_api_key(&state.policy_engine.pool, &parts.headers).await
-        {
+        if let Some(api_key_user) = validate_api_key(pool, &parts.headers).await {
             return Ok(api_key_user);
         }
 
         // Fall back to session auth (cookies / JWT)
-        let user_id = validate_request(&state.policy_engine.pool, &parts.headers).await?;
+        let user_id = validate_request(pool, &parts.headers).await?;
 
         // Resolve account from membership
-        let account_id = db::find_account_id_by_user(&state.policy_engine.pool, &user_id)
+        let account_id = db::find_account_id_by_user(pool, &user_id)
             .await
             .map_err(|e| {
                 warn!(error = %e, "auth: failed to resolve account");

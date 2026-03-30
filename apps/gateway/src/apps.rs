@@ -135,18 +135,28 @@ pub(crate) fn refresh_config(provider: &str) -> Option<&'static RefreshConfig> {
         .and_then(|p| p.refresh.as_ref())
 }
 
+/// Result of a token refresh operation.
+pub(crate) struct RefreshResult {
+    pub access_token: String,
+    /// New refresh token if the provider rotated it. `None` means keep the existing one.
+    pub refresh_token: Option<String>,
+    pub expires_at: i64,
+}
+
 /// Refresh an expired access token using the provider's token endpoint.
-/// Returns the new access token and updated expires_at timestamp.
 ///
 /// Client credentials are resolved in order:
 /// 1. Explicit `client_id`/`client_secret` (from BYOC AppConfig)
 /// 2. Env vars from `RefreshConfig` (platform defaults)
+///
+/// If the provider rotates the refresh token (returns a new one in the response),
+/// it is included in `RefreshResult.refresh_token`.
 pub(crate) async fn refresh_access_token(
     config: &RefreshConfig,
     refresh_token: &str,
     byoc_client_id: Option<&str>,
     byoc_client_secret: Option<&str>,
-) -> anyhow::Result<(String, i64)> {
+) -> anyhow::Result<RefreshResult> {
     let client_id = match byoc_client_id {
         Some(id) => id.to_string(),
         None => std::env::var(config.client_id_env)
@@ -192,12 +202,22 @@ pub(crate) async fn refresh_access_token(
         .and_then(|v| v.as_i64())
         .unwrap_or(3600);
 
+    // If the provider rotated the refresh token, capture it.
+    let new_refresh_token = body
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
         .as_secs() as i64;
 
-    Ok((access_token, now + expires_in))
+    Ok(RefreshResult {
+        access_token,
+        refresh_token: new_refresh_token,
+        expires_at: now + expires_in,
+    })
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

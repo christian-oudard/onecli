@@ -67,11 +67,11 @@ pub(crate) trait VaultProvider: Send + Sync {
 /// by name, iterates all providers for credential lookups.
 pub(crate) struct VaultService {
     providers: Vec<Box<dyn VaultProvider>>,
-    pool: PgPool,
+    pool: Option<PgPool>,
 }
 
 impl VaultService {
-    pub fn new(providers: Vec<Box<dyn VaultProvider>>, pool: PgPool) -> Self {
+    pub fn new(providers: Vec<Box<dyn VaultProvider>>, pool: Option<PgPool>) -> Self {
         Self { providers, pool }
     }
 
@@ -110,7 +110,9 @@ impl VaultService {
     pub async fn disconnect(&self, account_id: &str, provider: &str) -> Result<()> {
         let p = self.find_provider(provider)?;
         p.disconnect(account_id).await?;
-        db::delete_vault_connection(&self.pool, account_id, provider).await?;
+        if let Some(pool) = &self.pool {
+            db::delete_vault_connection(pool, account_id, provider).await?;
+        }
         Ok(())
     }
 

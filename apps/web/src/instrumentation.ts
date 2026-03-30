@@ -8,8 +8,29 @@
  *
  * In development, console.* is left untouched (pino-pretty handles
  * our explicit logger calls, and Next.js dev output stays readable).
+ *
+ * Also pushes the current rules snapshot to the gateway on startup so
+ * that a gateway restart picks up its configuration without requiring
+ * a manual config change.
  */
 export async function register() {
+  if (process.env.NEXT_RUNTIME === "nodejs") {
+    // Push rules to the gateway for every account on startup.
+    // This handles the case where the gateway restarted while the web UI was
+    // still running — the gateway starts with empty rules and this push fills it.
+    void (async () => {
+      try {
+        const { db } = await import("@onecli/db");
+        const { notifyGateway } =
+          await import("@/lib/services/gateway-service");
+        const accounts = await db.account.findMany({ select: { id: true } });
+        await Promise.all(accounts.map((a) => notifyGateway(a.id)));
+      } catch {
+        // Startup push is best-effort. Errors are already logged inside notifyGateway.
+      }
+    })();
+  }
+
   if (
     process.env.NEXT_RUNTIME === "nodejs" &&
     process.env.NODE_ENV === "production"

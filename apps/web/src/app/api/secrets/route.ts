@@ -3,6 +3,7 @@ import { resolveApiAuth } from "@/lib/api-auth";
 import { handleServiceError, unauthorized } from "@/lib/api-utils";
 import { invalidateGatewayCache } from "@/lib/gateway-invalidate";
 import { listSecrets, createSecret } from "@/lib/services/secret-service";
+import { notifyGateway } from "@/lib/services/gateway-service";
 import { createSecretSchema } from "@/lib/validations/secret";
 
 export const GET = async (request: NextRequest) => {
@@ -33,6 +34,7 @@ export const POST = async (request: NextRequest) => {
 
     const secret = await createSecret(auth.accountId, parsed.data);
     invalidateGatewayCache(request);
+    void notifyGateway(auth.accountId);
     return NextResponse.json(secret, { status: 201 });
   } catch (err) {
     return handleServiceError(err);

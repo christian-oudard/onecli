@@ -6,6 +6,7 @@ import {
   updatePolicyRule,
   deletePolicyRule,
 } from "@/lib/services/policy-rule-service";
+import { notifyGateway } from "@/lib/services/gateway-service";
 import { updatePolicyRuleSchema } from "@/lib/validations/policy-rule";
 
 type Params = { params: Promise<{ ruleId: string }> };
@@ -27,6 +28,7 @@ export const PATCH = async (request: NextRequest, { params }: Params) => {
 
     await updatePolicyRule(auth.accountId, ruleId, parsed.data);
     invalidateGatewayCache(request);
+    void notifyGateway(auth.accountId);
     return NextResponse.json({ success: true });
   } catch (err) {
     return handleServiceError(err);
@@ -41,6 +43,7 @@ export const DELETE = async (request: NextRequest, { params }: Params) => {
     const { ruleId } = await params;
     await deletePolicyRule(auth.accountId, ruleId);
     invalidateGatewayCache(request);
+    void notifyGateway(auth.accountId);
     return new NextResponse(null, { status: 204 });
   } catch (err) {
     return handleServiceError(err);

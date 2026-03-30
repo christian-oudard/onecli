@@ -3,6 +3,7 @@ import { getApp } from "@/lib/apps/registry";
 import { resolveOAuthCredentials } from "@/lib/apps/resolve-credentials";
 import { verifyOAuthState } from "@/lib/oauth-state";
 import { upsertConnection } from "@/lib/services/connection-service";
+import { notifyGateway } from "@/lib/services/gateway-service";
 import { logger } from "@/lib/logger";
 
 type Params = { params: Promise<{ provider: string }> };
@@ -56,6 +57,8 @@ export const GET = async (request: NextRequest, { params }: Params) => {
       scopes,
       metadata,
     });
+
+    void notifyGateway(state.accountId);
 
     return NextResponse.redirect(
       `${appUrl}/app-connect/${provider}?status=success`,

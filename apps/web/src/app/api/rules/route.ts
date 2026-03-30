@@ -6,6 +6,7 @@ import {
   listPolicyRules,
   createPolicyRule,
 } from "@/lib/services/policy-rule-service";
+import { notifyGateway } from "@/lib/services/gateway-service";
 import { createPolicyRuleSchema } from "@/lib/validations/policy-rule";
 
 export const GET = async (request: NextRequest) => {
@@ -36,6 +37,7 @@ export const POST = async (request: NextRequest) => {
 
     const rule = await createPolicyRule(auth.accountId, parsed.data);
     invalidateGatewayCache(request);
+    void notifyGateway(auth.accountId);
     return NextResponse.json(rule, { status: 201 });
   } catch (err) {
     return handleServiceError(err);

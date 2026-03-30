@@ -1,0 +1,93 @@
+{
+  "agents": [
+    {
+      "token": null,
+      "account_id": null,
+      "host_rules": [
+        {
+          "host_pattern": "api.anthropic.com",
+          "injection_rules": [
+            {
+              "path_pattern": "*",
+              "injections": [
+                { "action": "set_header", "name": "x-api-key", "value": "sk-ant-your-key-here" },
+                { "action": "remove_header", "name": "authorization" }
+              ]
+            }
+          ]
+        },
+        {
+          "host_pattern": "api.openai.com",
+          "injection_rules": [
+            {
+              "path_pattern": "/v1/*",
+              "injections": [
+                { "action": "set_header", "name": "authorization", "value": "Bearer sk-proj-your-key-here" }
+              ]
+            }
+          ]
+        },
+        {
+          "host_pattern": "*.googleapis.com",
+          "injection_rules": [
+            {
+              "path_pattern": "*",
+              "injections": [
+                { "action": "replace_header", "name": "authorization", "value": "Bearer ya29.your-oauth-token" }
+              ]
+            }
+          ]
+        }
+      ],
+      "policy_rules": [
+        {
+          "rule_id": "block-admin",
+          "host_pattern": "api.openai.com",
+          "path_pattern": "/v1/organization/*",
+          "method": null,
+          "action": "block",
+          "rate_limit": null,
+          "rate_limit_window": null
+        },
+        {
+          "rule_id": "ratelimit-completions",
+          "host_pattern": "api.openai.com",
+          "path_pattern": "/v1/chat/completions",
+          "method": "POST",
+          "action": "rate_limit",
+          "rate_limit": 60,
+          "rate_limit_window": "minute"
+        }
+      ]
+    },
+    {
+      "token": "aoc_agent-abc123",
+      "account_id": "acct_01HXYZ",
+      "host_rules": [
+        {
+          "host_pattern": "api.anthropic.com",
+          "injection_rules": [
+            {
+              "path_pattern": "/v1/*",
+              "injections": [
+                { "action": "set_header", "name": "x-api-key", "value": "sk-ant-team-key-here" },
+                { "action": "remove_header", "name": "authorization" }
+              ]
+            }
+          ]
+        }
+      ],
+      "policy_rules": [
+        {
+          "rule_id": "ratelimit-messages-hourly",
+          "host_pattern": "api.anthropic.com",
+          "path_pattern": "/v1/messages",
+          "method": "POST",
+          "action": "rate_limit",
+          "rate_limit": 500,
+          "rate_limit_window": "hour"
+        }
+      ]
+    }
+  ]
+}

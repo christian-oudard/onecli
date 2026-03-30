@@ -1,39 +1,16 @@
-//! Generic key-value cache with TTL.
+//! In-memory cache for rate limiting.
 //!
-//! OSS uses an in-memory `DashMap` backend. Cloud swaps this module
-//! via `#[cfg(feature = "cloud")]` to use Redis.
-//!
-//! All values are serialized to JSON — the `CacheStore` trait is
-//! type-agnostic. Consumers use namespaced keys to avoid collisions
-//! (e.g., `connect:{token}:{host}`, `cred:{user}:{host}`).
+//! Provides `del_by_prefix` (clear counters on rule reload) and
+//! `incr` (atomic counter with TTL for rate limit windows).
 
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
-use tracing::warn;
 
-/// Generic key-value cache with TTL.
-///
-/// Implementations must be `Send + Sync` for use in async contexts.
-/// Values are serialized to JSON internally — callers work with
-/// concrete types via serde.
-///
-/// Uses `async_trait` for dyn-compatibility (`Arc<dyn CacheStore>`).
+/// Rate-limit cache store.
 #[async_trait]
 pub(crate) trait CacheStore: Send + Sync {
-    /// Get a value by key. Returns `None` on miss or expiry.
-    async fn get_raw(&self, key: &str) -> Option<String>;
-
-    /// Set a raw string value with a TTL in seconds.
-    async fn set_raw(&self, key: &str, value: &str, ttl_secs: u64);
-
-    /// Delete a key.
-    #[allow(dead_code)]
-    async fn del(&self, key: &str);
-
     /// Delete all keys matching a prefix.
     async fn del_by_prefix(&self, prefix: &str);
 
@@ -41,29 +18,6 @@ pub(crate) trait CacheStore: Send + Sync {
     /// Sets TTL only on first increment (new key / expired key).
     /// Returns the new count, or `None` on error (graceful fallback).
     async fn incr(&self, key: &str, ttl_secs: u64) -> Option<u64>;
-}
-
-/// Extension methods for typed get/set on any `CacheStore`.
-impl dyn CacheStore + '_ {
-    /// Get a typed value by key.
-    pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
-        let raw = self.get_raw(key).await?;
-        match serde_json::from_str(&raw) {
-            Ok(val) => Some(val),
-            Err(e) => {
-                warn!(key, error = %e, "cache deserialization failed, treating as miss");
-                None
-            }
-        }
-    }
-
-    /// Set a typed value with TTL.
-    pub async fn set<T: Serialize>(&self, key: &str, value: &T, ttl_secs: u64) {
-        match serde_json::to_string(value) {
-            Ok(raw) => self.set_raw(key, &raw, ttl_secs).await,
-            Err(e) => warn!(key, error = %e, "cache serialization failed, value not cached"),
-        }
-    }
 }
 
 /// Create the cache store for this build.
@@ -98,36 +52,6 @@ impl InMemoryCacheStore {
 
 #[async_trait]
 impl CacheStore for InMemoryCacheStore {
-    async fn get_raw(&self, key: &str) -> Option<String> {
-        let entry = self.map.get(key)?;
-        if entry.expires_at > Instant::now() {
-            Some(entry.data.clone())
-        } else {
-            drop(entry);
-            self.map.remove(key);
-            None
-        }
-    }
-
-    async fn set_raw(&self, key: &str, value: &str, ttl_secs: u64) {
-        let now = Instant::now();
-        let expires_at = now
-            .checked_add(Duration::from_secs(ttl_secs))
-            .unwrap_or(now + Duration::from_secs(86_400 * 365));
-
-        self.map.insert(
-            key.to_string(),
-            CachedEntry {
-                data: value.to_string(),
-                expires_at,
-            },
-        );
-    }
-
-    async fn del(&self, key: &str) {
-        self.map.remove(key);
-    }
-
     async fn del_by_prefix(&self, prefix: &str) {
         self.map.retain(|key, _| !key.starts_with(prefix));
     }
@@ -160,90 +84,38 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    /// Helper: create a store as `Arc<dyn CacheStore>` to test the dyn path.
     fn new_store() -> Arc<dyn CacheStore> {
         Arc::new(InMemoryCacheStore::new())
     }
 
     #[tokio::test]
-    async fn get_returns_none_on_miss() {
-        let store = new_store();
-        let result: Option<String> = store.get("missing").await;
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn set_and_get_round_trip() {
-        let store = new_store();
-        store.set("key1", &"hello", 60).await;
-        let result: Option<String> = store.get("key1").await;
-        assert_eq!(result.as_deref(), Some("hello"));
-    }
-
-    #[tokio::test]
-    async fn get_returns_none_after_expiry() {
-        let store = new_store();
-        store.set("key1", &42u64, 0).await;
-        // TTL=0 means already expired
-        let result: Option<u64> = store.get("key1").await;
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn del_removes_entry() {
-        let store = new_store();
-        store.set("key1", &"value", 60).await;
-        store.del("key1").await;
-        let result: Option<String> = store.get("key1").await;
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
     async fn del_by_prefix_removes_matching_entries() {
         let store = new_store();
-        store.set("connect:acc1:tok1:host1", &"v1", 60).await;
-        store.set("connect:acc1:tok2:host2", &"v2", 60).await;
-        store.set("connect:acc2:tok3:host3", &"v3", 60).await;
-        store.set("rate:rule1:tok1:123", &"1", 60).await;
+
+        // Seed some entries via incr
+        store.incr("connect:acc1:tok1:host1", 60).await;
+        store.incr("connect:acc1:tok2:host2", 60).await;
+        store.incr("connect:acc2:tok3:host3", 60).await;
+        store.incr("rate:rule1:tok1:123", 60).await;
 
         store.del_by_prefix("connect:acc1:").await;
 
-        assert!(store
-            .get::<String>("connect:acc1:tok1:host1")
-            .await
-            .is_none());
-        assert!(store
-            .get::<String>("connect:acc1:tok2:host2")
-            .await
-            .is_none());
+        // Deleted entries return count=1 (fresh) on next incr
         assert_eq!(
-            store
-                .get::<String>("connect:acc2:tok3:host3")
-                .await
-                .as_deref(),
-            Some("v3")
+            store.incr("connect:acc1:tok1:host1", 60).await,
+            Some(1),
+            "should be fresh after delete"
+        );
+        // Surviving entries return count=2 (already had 1)
+        assert_eq!(
+            store.incr("connect:acc2:tok3:host3", 60).await,
+            Some(2),
+            "should still have prior count"
         );
         assert_eq!(
-            store.get::<String>("rate:rule1:tok1:123").await.as_deref(),
-            Some("1")
+            store.incr("rate:rule1:tok1:123", 60).await,
+            Some(2),
+            "non-matching prefix should survive"
         );
-    }
-
-    #[tokio::test]
-    async fn typed_round_trip() {
-        #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-        struct MyData {
-            name: String,
-            count: u32,
-        }
-
-        let store = new_store();
-        let data = MyData {
-            name: "test".to_string(),
-            count: 42,
-        };
-        store.set("typed", &data, 60).await;
-        let result: Option<MyData> = store.get("typed").await;
-        assert_eq!(result, Some(data));
     }
 }

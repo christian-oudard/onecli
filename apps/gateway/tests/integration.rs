@@ -1,12 +1,11 @@
 //! Integration tests for the onecli-gateway.
 //!
-//! Tests that don't require database access (health check, request rejection,
-//! unauthenticated tunneling, CA persistence) run against a gateway started
-//! without DATABASE_URL — the binary will fail to connect to PostgreSQL but
-//! still serves /healthz and handles unauthenticated CONNECT.
+//! **Standalone tests** (no DATABASE_URL needed) start the gateway with a
+//! `--rules` JSON file and verify health checks, tunneling, token auth, and
+//! CA persistence.
 //!
-//! Tests that require credential resolution (intercept, SSE streaming with auth)
-//! need a real PostgreSQL with seeded data and are marked `#[ignore]`.
+//! **DB-dependent tests** require DATABASE_URL + SECRET_ENCRYPTION_KEY and
+//! are gated behind those env vars (silently skip when unset).
 
 use base64::Engine;
 use std::io::{Read, Write};
@@ -14,16 +13,18 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::time::Duration;
 
-/// Encode an agent token as a Basic auth header value: `Basic base64({token}:)`.
+/// Encode an agent token as a Basic auth header value: `Basic base64(x:{token})`.
 fn basic_auth(token: &str) -> String {
-    // Convention: dummy username "x", token as password (like GitHub/GitLab)
     let encoded = base64::engine::general_purpose::STANDARD.encode(format!("x:{token}"));
     format!("Basic {encoded}")
 }
 
-/// Start the gateway binary with custom environment variables.
-fn start_gateway_with_envs(tmp_dir: &Path, envs: &[(&str, &str)]) -> (u16, std::process::Child) {
-    // Find an available port
+/// Start the gateway binary with custom CLI args and environment variables.
+fn start_gateway(
+    tmp_dir: &Path,
+    extra_args: &[&str],
+    envs: &[(&str, &str)],
+) -> (u16, std::process::Child) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let port = listener.local_addr().expect("local addr").port();
     drop(listener);
@@ -34,7 +35,12 @@ fn start_gateway_with_envs(tmp_dir: &Path, envs: &[(&str, &str)]) -> (u16, std::
     cmd.arg("--port")
         .arg(port.to_string())
         .arg("--data-dir")
-        .arg(tmp_dir.to_str().expect("valid utf8 path"));
+        .arg(tmp_dir.to_str().expect("valid utf8 path"))
+        .arg("--no-control-socket");
+
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
 
     for (key, val) in envs {
         cmd.env(key, val);
@@ -72,47 +78,28 @@ fn start_gateway_with_envs(tmp_dir: &Path, envs: &[(&str, &str)]) -> (u16, std::
     (port, child)
 }
 
-/// Start a gateway with DATABASE_URL and SECRET_ENCRYPTION_KEY set.
-/// Requires a real PostgreSQL instance at the given URL.
-fn start_gateway_with_db(
-    tmp_dir: &Path,
-    database_url: &str,
-    secret_key: &str,
-    extra_envs: &[(&str, &str)],
-) -> (u16, std::process::Child) {
-    let mut envs = vec![
-        ("DATABASE_URL", database_url),
-        ("SECRET_ENCRYPTION_KEY", secret_key),
-    ];
-    envs.extend_from_slice(extra_envs);
-    start_gateway_with_envs(tmp_dir, &envs)
+/// Write a rules.json file and return its path.
+fn write_rules(dir: &Path, json: &str) -> std::path::PathBuf {
+    let path = dir.join("rules.json");
+    std::fs::write(&path, json).expect("write rules.json");
+    path
 }
 
+// ── Standalone tests (no database) ──────────────────────────────────────
+
 #[test]
-fn health_check_returns_200() {
+fn standalone_health_check() {
     let tmp = tempfile::tempdir().expect("create temp dir");
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    if db_url.is_empty() {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    }
-    let key = std::env::var("SECRET_ENCRYPTION_KEY").unwrap_or_default();
-    if key.is_empty() {
-        eprintln!("skipping: SECRET_ENCRYPTION_KEY not set");
-        return;
-    }
-    let (port, mut child) = start_gateway_with_db(tmp.path(), &db_url, &key, &[]);
+    let (port, mut child) = start_gateway(tmp.path(), &[], &[]);
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect to gateway");
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-
     let req = format!("GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
-    stream.write_all(req.as_bytes()).expect("send request");
+    stream.write_all(req.as_bytes()).expect("send");
 
     let mut buf = vec![0u8; 512];
-    let n = stream.read(&mut buf).expect("read response");
+    let n = stream.read(&mut buf).expect("read");
     let resp = String::from_utf8_lossy(&buf[..n]);
-
     assert!(resp.contains("HTTP/1.1 200"), "expected 200, got: {resp}");
 
     child.kill().ok();
@@ -120,30 +107,18 @@ fn health_check_returns_200() {
 }
 
 #[test]
-fn non_connect_request_returns_400() {
+fn standalone_non_connect_returns_400() {
     let tmp = tempfile::tempdir().expect("create temp dir");
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    if db_url.is_empty() {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    }
-    let key = std::env::var("SECRET_ENCRYPTION_KEY").unwrap_or_default();
-    if key.is_empty() {
-        eprintln!("skipping: SECRET_ENCRYPTION_KEY not set");
-        return;
-    }
-    let (port, mut child) = start_gateway_with_db(tmp.path(), &db_url, &key, &[]);
+    let (port, mut child) = start_gateway(tmp.path(), &[], &[]);
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect to gateway");
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-
-    let req = format!("GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n");
-    stream.write_all(req.as_bytes()).expect("send request");
+    let req = "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    stream.write_all(req.as_bytes()).expect("send");
 
     let mut buf = vec![0u8; 512];
-    let n = stream.read(&mut buf).expect("read response");
+    let n = stream.read(&mut buf).expect("read");
     let resp = String::from_utf8_lossy(&buf[..n]);
-
     assert!(resp.contains("HTTP/1.1 400"), "expected 400, got: {resp}");
 
     child.kill().ok();
@@ -151,31 +126,24 @@ fn non_connect_request_returns_400() {
 }
 
 #[test]
-fn connect_without_auth_tunnels() {
+fn standalone_connect_without_token_tunnels() {
     let tmp = tempfile::tempdir().expect("create temp dir");
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    if db_url.is_empty() {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    }
-    let key = std::env::var("SECRET_ENCRYPTION_KEY").unwrap_or_default();
-    if key.is_empty() {
-        eprintln!("skipping: SECRET_ENCRYPTION_KEY not set");
-        return;
-    }
-    let (port, mut child) = start_gateway_with_db(tmp.path(), &db_url, &key, &[]);
+    // Rules with a named agent only, no anonymous entry.
+    let rules_path = write_rules(
+        tmp.path(),
+        r#"{"agents":[{"token":"aoc_test","host_rules":[],"policy_rules":[]}]}"#,
+    );
+    let rules_arg = format!("--rules={}", rules_path.display());
+    let (port, mut child) = start_gateway(tmp.path(), &[&rules_arg], &[]);
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect to gateway");
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-
-    // CONNECT without Proxy-Authorization → plain tunnel (200)
     let req = "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n";
     stream.write_all(req.as_bytes()).expect("send CONNECT");
 
     let mut buf = vec![0u8; 512];
-    let n = stream.read(&mut buf).expect("read response");
+    let n = stream.read(&mut buf).expect("read");
     let resp = String::from_utf8_lossy(&buf[..n]);
-
     assert!(resp.contains("200"), "expected 200 (tunnel), got: {resp}");
 
     child.kill().ok();
@@ -183,36 +151,56 @@ fn connect_without_auth_tunnels() {
 }
 
 #[test]
-fn connect_with_invalid_token_returns_401() {
+fn standalone_invalid_token_returns_407() {
     let tmp = tempfile::tempdir().expect("create temp dir");
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    if db_url.is_empty() {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    }
-    let key = std::env::var("SECRET_ENCRYPTION_KEY").unwrap_or_default();
-    if key.is_empty() {
-        eprintln!("skipping: SECRET_ENCRYPTION_KEY not set");
-        return;
-    }
-    let (port, mut child) = start_gateway_with_db(tmp.path(), &db_url, &key, &[]);
+    let rules_path = write_rules(
+        tmp.path(),
+        r#"{"agents":[{"token":"aoc_real","host_rules":[],"policy_rules":[]}]}"#,
+    );
+    let rules_arg = format!("--rules={}", rules_path.display());
+    let (port, mut child) = start_gateway(tmp.path(), &[&rules_arg], &[]);
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect to gateway");
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-
-    let auth = basic_auth("aoc_nonexistent_token");
+    let auth = basic_auth("aoc_wrong");
     let req = format!(
         "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nProxy-Authorization: {auth}\r\n\r\n"
     );
     stream.write_all(req.as_bytes()).expect("send CONNECT");
 
     let mut buf = vec![0u8; 512];
-    let n = stream.read(&mut buf).expect("read response");
+    let n = stream.read(&mut buf).expect("read");
     let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("407"), "expected 407, got: {resp}");
 
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn standalone_valid_token_returns_200() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let rules_path = write_rules(
+        tmp.path(),
+        r#"{"agents":[{"token":"aoc_mytoken","host_rules":[{"host_pattern":"api.anthropic.com","injection_rules":[{"path_pattern":"*","injections":[{"action":"set_header","name":"x-api-key","value":"sk-test"}]}]}],"policy_rules":[]}]}"#,
+    );
+    let rules_arg = format!("--rules={}", rules_path.display());
+    let (port, mut child) = start_gateway(tmp.path(), &[&rules_arg], &[]);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let auth = basic_auth("aoc_mytoken");
+    let req = format!(
+        "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nProxy-Authorization: {auth}\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).expect("send CONNECT");
+
+    let mut buf = vec![0u8; 512];
+    let n = stream.read(&mut buf).expect("read");
+    let resp = String::from_utf8_lossy(&buf[..n]);
     assert!(
-        resp.contains("407"),
-        "expected 407 Proxy Authentication Required for invalid token, got: {resp}"
+        resp.contains("200"),
+        "expected 200 (intercept), got: {resp}"
     );
 
     child.kill().ok();
@@ -220,39 +208,142 @@ fn connect_with_invalid_token_returns_401() {
 }
 
 #[test]
-fn ca_persists_across_restarts() {
+fn standalone_anonymous_agent_intercepts() {
     let tmp = tempfile::tempdir().expect("create temp dir");
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    if db_url.is_empty() {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    }
-    let key = std::env::var("SECRET_ENCRYPTION_KEY").unwrap_or_default();
-    if key.is_empty() {
-        eprintln!("skipping: SECRET_ENCRYPTION_KEY not set");
-        return;
-    }
+    let rules_path = write_rules(
+        tmp.path(),
+        r#"{"agents":[{"token":null,"host_rules":[{"host_pattern":"api.anthropic.com","injection_rules":[{"path_pattern":"*","injections":[{"action":"set_header","name":"x-api-key","value":"sk-anon"}]}]}],"policy_rules":[]}]}"#,
+    );
+    let rules_arg = format!("--rules={}", rules_path.display());
+    let (port, mut child) = start_gateway(tmp.path(), &[&rules_arg], &[]);
 
-    // First start — generates CA
-    let (_, mut child1) = start_gateway_with_db(tmp.path(), &db_url, &key, &[]);
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    // No Proxy-Authorization header. Anonymous agent should match.
+    let req = "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n";
+    stream.write_all(req.as_bytes()).expect("send CONNECT");
+
+    let mut buf = vec![0u8; 512];
+    let n = stream.read(&mut buf).expect("read");
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        resp.contains("200"),
+        "expected 200 (intercept), got: {resp}"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn standalone_ca_persists_across_restarts() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+
+    // First start, generates CA.
+    let (_, mut child1) = start_gateway(tmp.path(), &[], &[]);
     child1.kill().ok();
     child1.wait().ok();
 
-    // Verify CA files exist
     let ca_key = tmp.path().join("gateway").join("ca.key");
     let ca_cert = tmp.path().join("gateway").join("ca.pem");
     assert!(ca_key.exists(), "ca.key should exist after first run");
     assert!(ca_cert.exists(), "ca.pem should exist after first run");
+    let cert_1 = std::fs::read_to_string(&ca_cert).expect("read ca.pem");
 
-    let cert_content_1 = std::fs::read_to_string(&ca_cert).expect("read ca.pem");
-
-    // Second start — should load existing CA
-    let (_, mut child2) = start_gateway_with_db(tmp.path(), &db_url, &key, &[]);
+    // Second start, should load existing CA.
+    let (_, mut child2) = start_gateway(tmp.path(), &[], &[]);
     child2.kill().ok();
     child2.wait().ok();
 
-    let cert_content_2 = std::fs::read_to_string(&ca_cert).expect("read ca.pem again");
+    let cert_2 = std::fs::read_to_string(&ca_cert).expect("read ca.pem again");
+    assert_eq!(cert_1, cert_2, "CA cert should persist across restarts");
+}
 
-    // Same CA cert across restarts
-    assert_eq!(cert_content_1, cert_content_2, "CA cert should persist");
+#[test]
+fn standalone_empty_rules_tunnels_everything() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    // No --rules flag, no config file exists. Gateway starts with empty snapshot.
+    let (port, mut child) = start_gateway(tmp.path(), &[], &[]);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let req = "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+    stream.write_all(req.as_bytes()).expect("send CONNECT");
+
+    let mut buf = vec![0u8; 512];
+    let n = stream.read(&mut buf).expect("read");
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("200"), "expected 200 (tunnel), got: {resp}");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+// ── DB-dependent tests (skip when DATABASE_URL not set) ─────────────────
+
+fn require_db_env() -> Option<(String, String)> {
+    let db_url = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let key = std::env::var("SECRET_ENCRYPTION_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    Some((db_url, key))
+}
+
+#[test]
+fn health_check_returns_200() {
+    let Some((db_url, key)) = require_db_env() else {
+        eprintln!("skipping: DATABASE_URL or SECRET_ENCRYPTION_KEY not set");
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let (port, mut child) = start_gateway(
+        tmp.path(),
+        &[],
+        &[("DATABASE_URL", &db_url), ("SECRET_ENCRYPTION_KEY", &key)],
+    );
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    let req = format!("GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+    stream.write_all(req.as_bytes()).expect("send");
+
+    let mut buf = vec![0u8; 512];
+    let n = stream.read(&mut buf).expect("read");
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("HTTP/1.1 200"), "expected 200, got: {resp}");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn connect_with_invalid_token_returns_401() {
+    let Some((db_url, key)) = require_db_env() else {
+        eprintln!("skipping: DATABASE_URL or SECRET_ENCRYPTION_KEY not set");
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let (port, mut child) = start_gateway(
+        tmp.path(),
+        &[],
+        &[("DATABASE_URL", &db_url), ("SECRET_ENCRYPTION_KEY", &key)],
+    );
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let auth = basic_auth("aoc_nonexistent_token");
+    let req = format!(
+        "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nProxy-Authorization: {auth}\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).expect("send CONNECT");
+
+    let mut buf = vec![0u8; 512];
+    let n = stream.read(&mut buf).expect("read");
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("407"), "expected 407, got: {resp}");
+
+    child.kill().ok();
+    child.wait().ok();
 }

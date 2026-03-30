@@ -6,6 +6,9 @@ mod auth;
 mod auth;
 
 mod ca;
+mod config;
+mod connect;
+mod control;
 
 #[cfg(not(feature = "cloud"))]
 mod cache;
@@ -15,8 +18,6 @@ mod cache;
 mod cache;
 
 mod apps;
-mod connect;
-
 #[cfg(not(feature = "cloud"))]
 mod crypto;
 
@@ -28,18 +29,20 @@ mod db;
 mod gateway;
 mod inject;
 mod policy;
+mod rules;
+mod token_state;
 mod vault;
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::ca::CertificateAuthority;
-use crate::connect::PolicyEngine;
 use crate::gateway::GatewayServer;
 use crate::vault::bitwarden::{BitwardenConfig, BitwardenVaultProvider};
 use crate::vault::VaultService;
@@ -50,6 +53,13 @@ use crate::vault::VaultService;
     about = "OneCLI MITM gateway for credential injection"
 )]
 struct Cli {
+    /// Address to bind the proxy listener to.
+    /// Defaults to 127.0.0.1. Use 0.0.0.0 to accept connections from other
+    /// hosts, but note that anonymous agents (token: null) are rejected on
+    /// non-loopback addresses unless --allow-public-anonymous is also set.
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: IpAddr,
+
     /// Port to listen on.
     #[arg(long, default_value = "10255")]
     port: u16,
@@ -57,6 +67,24 @@ struct Cli {
     /// Data directory for CA certificates and persistent state.
     #[arg(long, default_value = default_data_dir())]
     data_dir: PathBuf,
+
+    /// Path to the rules JSON config file.
+    /// Defaults to $XDG_CONFIG_HOME/onecli/rules.json (non-root)
+    /// or /etc/onecli/rules.json (root).
+    #[arg(long)]
+    rules: Option<PathBuf>,
+
+    /// Disable the Unix domain control socket.
+    /// By default the gateway listens for rule pushes from the web UI.
+    #[arg(long)]
+    no_control_socket: bool,
+
+    /// Allow anonymous agents (token: null) when bound to a non-loopback
+    /// address. By default the gateway refuses to start in this configuration
+    /// because any host that can reach the port would be able to use your
+    /// credentials without authentication.
+    #[arg(long)]
+    allow_public_anonymous: bool,
 }
 
 fn default_data_dir() -> &'static str {
@@ -89,8 +117,6 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-
-    // Expand ~ in data dir
     let data_dir = expand_tilde(&cli.data_dir);
 
     info!(data_dir = %data_dir.display(), "starting onecli-gateway");
@@ -98,47 +124,166 @@ async fn main() -> Result<()> {
     // Load or generate CA
     let ca = CertificateAuthority::load_or_generate(&data_dir).await?;
 
-    // Connect to PostgreSQL
-    // Support both DATABASE_URL (OSS) and individual DB_* vars (cloud ECS from Secrets Manager)
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => {
-            let host =
-                std::env::var("DB_HOST").context("DATABASE_URL or DB_HOST env var must be set")?;
-            let port = std::env::var("DB_PORT").unwrap_or_else(|_| "5432".to_string());
-            let user = std::env::var("DB_USERNAME").context("DB_USERNAME env var must be set")?;
-            let pass = std::env::var("DB_PASSWORD").context("DB_PASSWORD env var must be set")?;
-            let name = std::env::var("DB_NAME").unwrap_or_else(|_| "onecli".to_string());
-            format!("postgresql://{user}:{pass}@{host}:{port}/{name}")
+    // ── Rules watch channel ─────────────────────────────────────────────
+
+    let (rules_tx, rules_rx) = rules::channel();
+
+    // Load initial rules from config file.
+    let rules_path = config::resolve_rules_path(cli.rules.as_deref());
+    match config::load_rules_from_file(&rules_path).await {
+        Ok(snapshot) => {
+            let agent_count = snapshot.agents.len();
+            rules::check_anonymous_public(&snapshot, cli.bind, cli.allow_public_anonymous)
+                .map_err(|msg| anyhow::anyhow!("{msg}"))?;
+            rules_tx.send(Arc::new(snapshot)).ok();
+            if agent_count > 0 {
+                info!(path = %rules_path.display(), agents = agent_count, "loaded rules from config");
+            } else {
+                info!(path = %rules_path.display(), "config file not found; starting with empty rules");
+            }
+        }
+        Err(e) => {
+            warn!(error = ?e, "failed to load rules config; starting with empty rules");
+        }
+    }
+
+    // SIGHUP handler: reload the config file.
+    {
+        let tx = rules_tx.clone();
+        let path = rules_path.clone();
+        let bind = cli.bind;
+        let allow_public_anonymous = cli.allow_public_anonymous;
+        tokio::spawn(async move {
+            let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("registering SIGHUP handler");
+            loop {
+                sighup.recv().await;
+                match config::load_rules_from_file(&path).await {
+                    Ok(snapshot) => {
+                        if let Err(msg) =
+                            rules::check_anonymous_public(&snapshot, bind, allow_public_anonymous)
+                        {
+                            warn!("SIGHUP: rejecting reload: {msg}");
+                            continue;
+                        }
+                        tx.send(Arc::new(snapshot)).ok();
+                        info!(path = %path.display(), "reloaded rules on SIGHUP");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "SIGHUP: failed to reload rules; keeping current rules");
+                    }
+                }
+            }
+        });
+    }
+
+    // ── Control socket ──────────────────────────────────────────────────
+
+    if !cli.no_control_socket {
+        match control::socket_path() {
+            Some(path) => {
+                let tx = rules_tx.clone();
+                let bind = cli.bind;
+                let allow_public_anonymous = cli.allow_public_anonymous;
+                tokio::spawn(async move {
+                    if let Err(e) = control::run(path, tx, bind, allow_public_anonymous).await {
+                        warn!(error = %e, "control socket stopped");
+                    }
+                });
+            }
+            None => {
+                warn!(
+                    "XDG_RUNTIME_DIR not set and /proc/self/status not readable; \
+                     control socket disabled (use --no-control-socket to suppress this warning)"
+                );
+            }
+        }
+    }
+
+    // ── Optional database (vault integration only) ───────────────────────
+
+    let db_url = std::env::var("DATABASE_URL").ok().or_else(|| {
+        let host = std::env::var("DB_HOST").ok()?;
+        let port = std::env::var("DB_PORT").unwrap_or_else(|_| "5432".to_string());
+        let user = std::env::var("DB_USERNAME").ok()?;
+        let pass = std::env::var("DB_PASSWORD").ok()?;
+        let name = std::env::var("DB_NAME").unwrap_or_else(|_| "onecli".to_string());
+        Some(format!("postgresql://{user}:{pass}@{host}:{port}/{name}"))
+    });
+
+    let db_pool = match db_url {
+        Some(url) => match db::create_pool(&url).await {
+            Ok(pool) => {
+                info!("database connection established (vault integration enabled)");
+                Some(pool)
+            }
+            Err(e) => {
+                warn!(error = %e, "database connection failed; vault integration disabled");
+                None
+            }
+        },
+        None => {
+            info!("no DATABASE_URL; running in standalone mode (vault integration disabled)");
+            None
         }
     };
-    let pool = db::create_pool(&database_url).await?;
 
-    // Load crypto service for secret decryption
-    // OSS: AES-256-GCM with local key from SECRET_ENCRYPTION_KEY
-    // Cloud: KMS envelope decryption (calls KMS Decrypt for each data key)
-    let crypto = Arc::new(crypto::CryptoService::from_env().await?);
+    // ── Vault service ────────────────────────────────────────────────────
 
-    let policy_engine = Arc::new(PolicyEngine { pool, crypto });
+    // Keep a clone for browser auth (GatewayState.db_pool) before moving into vault service.
+    let db_pool_for_auth = db_pool.clone();
 
-    // Initialize vault service with Bitwarden provider
-    let proxy_url = std::env::var("BITWARDEN_PROXY_URL")
-        .unwrap_or_else(|_| "wss://ap.lesspassword.dev".to_string());
-    let bitwarden =
-        BitwardenVaultProvider::new(BitwardenConfig { proxy_url }, policy_engine.pool.clone());
-    let vault_service = Arc::new(VaultService::new(
-        vec![Box::new(bitwarden)],
-        policy_engine.pool.clone(),
-    ));
+    let vault_service = if let Some(pool) = db_pool {
+        let proxy_url = std::env::var("BITWARDEN_PROXY_URL")
+            .unwrap_or_else(|_| "wss://ap.lesspassword.dev".to_string());
+        let bitwarden = BitwardenVaultProvider::new(BitwardenConfig { proxy_url }, pool.clone());
+        Arc::new(VaultService::new(vec![Box::new(bitwarden)], Some(pool)))
+    } else {
+        Arc::new(VaultService::new(vec![], None))
+    };
 
-    // Initialize cache store
-    // OSS: in-memory DashMap. Cloud: Redis (ElastiCache with TLS + AUTH).
+    // ── Cache store ──────────────────────────────────────────────────────
+
     let cache = cache::create_store().await?;
+
+    // ── Token state store (OAuth runtime credentials) ────────────────────
+
+    let token_store = match crypto::CryptoService::from_env().await {
+        Ok(crypto) => match token_state::TokenStateStore::open(&data_dir, crypto).await {
+            Ok(store) => {
+                info!("token state store opened (OAuth app connections enabled)");
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                warn!(error = ?e, "failed to open token state store; OAuth app connections disabled");
+                None
+            }
+        },
+        Err(_) => {
+            info!("SECRET_ENCRYPTION_KEY not set; OAuth app connections disabled");
+            None
+        }
+    };
 
     info!(port = cli.port, "gateway ready");
 
     // Start the gateway server (blocks forever)
-    let server = GatewayServer::new(ca, cli.port, policy_engine, vault_service, cache);
+    let state = gateway::GatewayState {
+        ca: Arc::new(ca),
+        http_client: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .danger_accept_invalid_certs(
+                std::env::var("GATEWAY_DANGER_ACCEPT_INVALID_CERTS").is_ok(),
+            )
+            .build()
+            .expect("build HTTP client"),
+        rules: rules_rx,
+        cache,
+        vault_service,
+        db_pool: db_pool_for_auth,
+        token_store,
+    };
+    let server = GatewayServer::new(cli.bind, cli.port, state);
     server.run().await
 }
 

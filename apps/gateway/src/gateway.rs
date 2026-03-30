@@ -7,7 +7,7 @@
 //! before reaching the router via a `tower::service_fn` wrapper, following the
 //! official Axum http-proxy example pattern.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -27,12 +27,18 @@ use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 
+use sqlx::PgPool;
+use tokio::sync::watch;
+
+use crate::apps;
 use crate::auth::AuthUser;
 use crate::ca::CertificateAuthority;
 use crate::cache::CacheStore;
-use crate::connect::{self, ConnectError, PolicyEngine};
+use crate::connect::{self, ConnectError};
 use crate::inject::{self, InjectionRule};
 use crate::policy::{self, PolicyDecision, PolicyRule};
+use crate::rules::RulesSnapshot;
+use crate::token_state::TokenStateStore;
 use crate::vault;
 
 // ── GatewayState ───────────────────────────────────────────────────────
@@ -42,16 +48,23 @@ use crate::vault;
 pub(crate) struct GatewayState {
     pub ca: Arc<CertificateAuthority>,
     pub http_client: reqwest::Client,
-    pub policy_engine: Arc<PolicyEngine>,
+    /// Watch channel receiver for the in-memory rules snapshot.
+    /// `borrow()` returns the current snapshot with zero I/O.
+    pub rules: watch::Receiver<Arc<RulesSnapshot>>,
     pub cache: Arc<dyn CacheStore>,
     /// Provider-agnostic vault service for credential fetching.
     pub vault_service: Arc<vault::VaultService>,
+    /// Database pool for browser auth (None in standalone mode).
+    pub db_pool: Option<PgPool>,
+    /// SQLite token state store for OAuth app connections (None if no encryption key).
+    pub token_store: Option<Arc<TokenStateStore>>,
 }
 
 // ── GatewayServer ───────────────────────────────────────────────────────
 
 pub struct GatewayServer {
     state: GatewayState,
+    bind: IpAddr,
     port: u16,
 }
 
@@ -59,6 +72,7 @@ pub struct GatewayServer {
 ///
 /// - Redirects are disabled so 3xx responses are forwarded to the client as-is.
 /// - Invalid certs are optionally accepted via `GATEWAY_DANGER_ACCEPT_INVALID_CERTS`.
+#[cfg(test)]
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -68,27 +82,13 @@ fn build_http_client() -> reqwest::Client {
 }
 
 impl GatewayServer {
-    pub fn new(
-        ca: CertificateAuthority,
-        port: u16,
-        policy_engine: Arc<PolicyEngine>,
-        vault_service: Arc<vault::VaultService>,
-        cache: Arc<dyn CacheStore>,
-    ) -> Self {
-        let state = GatewayState {
-            ca: Arc::new(ca),
-            http_client: build_http_client(),
-            policy_engine,
-            cache,
-            vault_service,
-        };
-
-        Self { state, port }
+    pub fn new(bind: IpAddr, port: u16, state: GatewayState) -> Self {
+        Self { state, bind, port }
     }
 
     /// Start the gateway TCP listener. Runs forever.
     pub async fn run(&self) -> Result<()> {
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
+        let addr = SocketAddr::new(self.bind, self.port);
         let listener = TcpListener::bind(addr)
             .await
             .context("binding TCP listener")?;
@@ -244,30 +244,20 @@ async fn handle_connect(
     // Extract agent token from Proxy-Authorization header.
     let agent_token = inject::extract_agent_token(&req).filter(|t| !t.is_empty());
 
-    let (mut intercept, mut injection_rules, policy_rules, account_id) = if let Some(ref token) =
-        agent_token
-    {
-        match connect::resolve(token, &hostname, &state.policy_engine, &*state.cache).await {
+    let (mut intercept, mut injection_rules, policy_rules, account_id, app_connections) = {
+        match connect::resolve(agent_token.as_deref(), &hostname, &state.rules) {
             Ok(resp) => (
                 resp.intercept,
                 resp.injection_rules,
                 resp.policy_rules,
                 resp.account_id,
+                resp.app_connections,
             ),
             Err(ConnectError::InvalidToken) => {
                 warn!(peer = %peer_addr, host = %host, "CONNECT rejected: invalid agent token");
                 return Ok(respond_407());
             }
-            Err(ConnectError::Internal(e)) => {
-                warn!(peer = %peer_addr, host = %host, error = %e, "CONNECT rejected: internal error");
-                let mut resp = Response::new(axum::body::Body::empty());
-                *resp.status_mut() = StatusCode::BAD_GATEWAY;
-                return Ok(resp);
-            }
         }
-    } else {
-        // No auth — plain tunnel (no MITM, no injection)
-        (false, vec![], vec![], None)
     };
 
     // Vault fallback: if no DB secrets matched, try vault providers for this user.
@@ -283,6 +273,31 @@ async fn handle_connect(
                         account_id = %aid,
                         "using vault credential"
                     );
+                }
+            }
+        }
+    }
+
+    // App connection fallback: if an app connection matches this host,
+    // read the OAuth token from SQLite and build injection rules.
+    if let Some(ref token_store) = state.token_store {
+        if let Some(ref aid) = account_id {
+            if let Some(provider) = apps::provider_for_host(&hostname) {
+                let has_connection = app_connections.iter().any(|ac| ac.provider == provider);
+                if has_connection {
+                    match inject_app_connection(token_store, provider, aid, &hostname).await {
+                        Ok(Some(app_rules)) => {
+                            injection_rules.extend(app_rules);
+                            intercept = true;
+                            info!(host = %hostname, provider, "using app connection credential");
+                        }
+                        Ok(None) => {
+                            warn!(host = %hostname, provider, "app connection configured but no token state found");
+                        }
+                        Err(e) => {
+                            warn!(error = ?e, host = %hostname, provider, "app connection token error");
+                        }
+                    }
                 }
             }
         }
@@ -603,6 +618,52 @@ fn is_forwarded_response_header(name: &HeaderName) -> bool {
 /// Strip port from a `host:port` string, returning just the hostname.
 fn strip_port(host: &str) -> &str {
     host.split(':').next().unwrap_or(host)
+}
+
+/// Read an app connection's OAuth token from SQLite, refresh if expired,
+/// and return injection rules for the given hostname.
+async fn inject_app_connection(
+    store: &TokenStateStore,
+    provider: &str,
+    account_id: &str,
+    hostname: &str,
+) -> Result<Option<Vec<InjectionRule>>> {
+    let lock = store.refresh_lock(provider, account_id);
+    let _guard = lock.lock().await;
+
+    let Some(mut token_state) = store.get(provider, account_id).await? else {
+        return Ok(None);
+    };
+
+    // Proactive refresh: if token is expired or near-expiry, refresh it.
+    if token_state.is_expired() {
+        if let Some(config) = apps::refresh_config(provider) {
+            match apps::refresh_access_token(config, &token_state.refresh_token, None, None).await {
+                Ok(result) => {
+                    token_state.access_token = result.access_token;
+                    token_state.expires_at = Some(result.expires_at);
+                    if let Some(new_refresh) = result.refresh_token {
+                        token_state.refresh_token = new_refresh;
+                    }
+                    store.put(provider, account_id, &token_state).await?;
+                    info!(provider, "refreshed expired OAuth token");
+                }
+                Err(e) => {
+                    warn!(error = ?e, provider, "OAuth token refresh failed, using expired token");
+                }
+            }
+        }
+    }
+
+    let injections = apps::build_app_injections(provider, hostname, &token_state.access_token);
+    if injections.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(vec![InjectionRule {
+        path_pattern: "*".to_string(),
+        injections,
+    }]))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

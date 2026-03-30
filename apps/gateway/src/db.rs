@@ -1,54 +1,21 @@
 //! Direct database access via SQLx.
 //!
-//! Used when `DATABASE_URL` is set to query the PostgreSQL database directly,
-//! bypassing the Next.js API. Vault connection state is managed by the gateway;
-//! all other tables are read-only (Prisma / Next.js remains the writer).
+//! The gateway uses the database only for browser auth (user/account lookup) and
+//! vault connection state. Rules and secrets are delivered via the in-memory watch
+//! channel — either loaded from the JSON config file or pushed by the web UI over
+//! the control socket.
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{FromRow, PgPool};
 
-/// Create a PostgreSQL connection pool from `DATABASE_URL`.
+/// Create a PostgreSQL connection pool from a connection URL.
 pub(crate) async fn create_pool(database_url: &str) -> Result<PgPool> {
     PgPoolOptions::new()
         .max_connections(5)
         .connect(database_url)
         .await
         .context("connecting to PostgreSQL")
-}
-
-// ── Row types ───────────────────────────────────────────────────────────
-
-/// An agent row from the `agents` table.
-#[derive(Debug, FromRow)]
-pub(crate) struct AgentRow {
-    pub id: String,
-    pub account_id: String,
-    pub secret_mode: String,
-}
-
-/// A secret row from the `secrets` table.
-#[derive(Debug, FromRow)]
-pub(crate) struct SecretRow {
-    #[sqlx(rename = "type")]
-    pub type_: String,
-    pub encrypted_value: String,
-    pub host_pattern: String,
-    pub path_pattern: Option<String>,
-    pub injection_config: Option<serde_json::Value>,
-}
-
-/// A policy rule row from the `policy_rules` table.
-#[derive(Debug, FromRow)]
-pub(crate) struct PolicyRuleRow {
-    pub id: String,
-    pub host_pattern: String,
-    pub path_pattern: Option<String>,
-    pub method: Option<String>,
-    pub agent_id: Option<String>,
-    pub action: String,
-    pub rate_limit: Option<i32>,
-    pub rate_limit_window: Option<String>,
 }
 
 /// A user row from the `users` table.
@@ -113,133 +80,6 @@ pub(crate) async fn find_api_key(pool: &PgPool, key: &str) -> Result<Option<ApiK
     .fetch_optional(pool)
     .await
     .context("querying api_keys by key")
-}
-
-/// Look up an agent by its access token.
-pub(crate) async fn find_agent_by_token(
-    pool: &PgPool,
-    access_token: &str,
-) -> Result<Option<AgentRow>> {
-    sqlx::query_as::<_, AgentRow>(
-        r#"SELECT id, account_id, secret_mode FROM agents WHERE access_token = $1 LIMIT 1"#,
-    )
-    .bind(access_token)
-    .fetch_optional(pool)
-    .await
-    .context("querying agent by access_token")
-}
-
-/// Find all secrets for a given account.
-pub(crate) async fn find_secrets_by_account(
-    pool: &PgPool,
-    account_id: &str,
-) -> Result<Vec<SecretRow>> {
-    sqlx::query_as::<_, SecretRow>(
-        r#"SELECT type, encrypted_value, host_pattern, path_pattern, injection_config FROM secrets WHERE account_id = $1"#,
-    )
-    .bind(account_id)
-    .fetch_all(pool)
-    .await
-    .context("querying secrets by account_id")
-}
-
-/// Find secrets assigned to a specific agent (selective mode).
-pub(crate) async fn find_secrets_by_agent(pool: &PgPool, agent_id: &str) -> Result<Vec<SecretRow>> {
-    sqlx::query_as::<_, SecretRow>(
-        r#"SELECT s.type, s.encrypted_value, s.host_pattern, s.path_pattern, s.injection_config
-           FROM secrets s
-           INNER JOIN agent_secrets as_ ON s.id = as_.secret_id
-           WHERE as_.agent_id = $1"#,
-    )
-    .bind(agent_id)
-    .fetch_all(pool)
-    .await
-    .context("querying secrets by agent_id")
-}
-
-/// Find all enabled policy rules for a given account.
-pub(crate) async fn find_policy_rules_by_account(
-    pool: &PgPool,
-    account_id: &str,
-) -> Result<Vec<PolicyRuleRow>> {
-    sqlx::query_as::<_, PolicyRuleRow>(
-        r#"SELECT id, host_pattern, path_pattern, method, agent_id,
-                  action, rate_limit, rate_limit_window
-           FROM policy_rules
-           WHERE account_id = $1 AND enabled = true
-             AND action IN ('block', 'rate_limit')"#,
-    )
-    .bind(account_id)
-    .fetch_all(pool)
-    .await
-    .context("querying policy_rules by account_id")
-}
-
-// ── App config queries (BYOC credentials) ─────────────────────────────
-
-/// An app config row from the `app_configs` table.
-#[derive(Debug, FromRow)]
-pub(crate) struct AppConfigRow {
-    pub settings: Option<serde_json::Value>,
-    pub credentials: Option<String>,
-}
-
-/// Find an enabled BYOC app config for an account + provider.
-pub(crate) async fn find_app_config(
-    pool: &PgPool,
-    account_id: &str,
-    provider: &str,
-) -> Result<Option<AppConfigRow>> {
-    sqlx::query_as::<_, AppConfigRow>(
-        r#"SELECT settings, credentials FROM app_configs
-           WHERE account_id = $1 AND provider = $2 AND enabled = true
-           LIMIT 1"#,
-    )
-    .bind(account_id)
-    .bind(provider)
-    .fetch_optional(pool)
-    .await
-    .context("querying app_config by account_id + provider")
-}
-
-// ── App connection queries ─────────────────────────────────────────────
-
-/// An app connection row from the `app_connections` table.
-#[derive(Debug, FromRow)]
-pub(crate) struct AppConnectionRow {
-    pub provider: String,
-    pub credentials: Option<String>,
-}
-
-/// Find all connected app connections for a given account.
-pub(crate) async fn find_app_connections_by_account(
-    pool: &PgPool,
-    account_id: &str,
-) -> Result<Vec<AppConnectionRow>> {
-    sqlx::query_as::<_, AppConnectionRow>(
-        r#"SELECT provider, credentials FROM app_connections WHERE account_id = $1 AND status = 'connected'"#,
-    )
-    .bind(account_id)
-    .fetch_all(pool)
-    .await
-    .context("querying app_connections by account_id")
-}
-
-/// Find app connections assigned to a specific agent (selective mode).
-pub(crate) async fn find_app_connections_by_agent(
-    pool: &PgPool,
-    agent_id: &str,
-) -> Result<Vec<AppConnectionRow>> {
-    sqlx::query_as::<_, AppConnectionRow>(
-        r#"SELECT ac.provider, ac.credentials
-           FROM app_connections ac
-           INNER JOIN agent_app_connections aac ON ac.id = aac.app_connection_id
-           WHERE aac.agent_id = $1 AND ac.status = 'connected'"#,
-    )
-    .bind(agent_id)
-    .fetch_all(pool)
-    .await
-    .context("querying app_connections by agent_id")
 }
 
 // ── Vault connection queries ────────────────────────────────────────────

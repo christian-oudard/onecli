@@ -9,6 +9,7 @@
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use ring::aead;
+use ring::rand::SecureRandom;
 
 const KEY_LEN: usize = 32;
 const IV_LEN: usize = 12;
@@ -45,6 +46,36 @@ impl CryptoService {
         let key = aead::LessSafeKey::new(unbound_key);
 
         Ok(Self { key })
+    }
+
+    /// Encrypt a plaintext string into the format `{iv_b64}:{authTag_b64}:{ciphertext_b64}`.
+    ///
+    /// Produces output compatible with the Node.js `CryptoService` in `lib/crypto.ts`.
+    pub fn encrypt(&self, plaintext: &str) -> Result<String> {
+        let rng = ring::rand::SystemRandom::new();
+        let mut iv = [0u8; IV_LEN];
+        rng.fill(&mut iv)
+            .map_err(|_| anyhow::anyhow!("failed to generate random IV"))?;
+
+        let nonce = aead::Nonce::try_assume_unique_for_key(&iv)
+            .map_err(|_| anyhow::anyhow!("invalid nonce"))?;
+
+        let mut in_out = plaintext.as_bytes().to_vec();
+        self.key
+            .seal_in_place_append_tag(nonce, aead::Aad::empty(), &mut in_out)
+            .map_err(|_| anyhow::anyhow!("encryption failed"))?;
+
+        // ring appends the 16-byte tag after the ciphertext
+        let ciphertext = &in_out[..plaintext.len()];
+        let auth_tag = &in_out[plaintext.len()..];
+
+        let b64 = &base64::engine::general_purpose::STANDARD;
+        Ok(format!(
+            "{}:{}:{}",
+            b64.encode(iv),
+            b64.encode(auth_tag),
+            b64.encode(ciphertext),
+        ))
     }
 
     /// Decrypt a value in the format `{iv_b64}:{authTag_b64}:{ciphertext_b64}`.
@@ -137,6 +168,56 @@ mod tests {
             b64.encode(auth_tag),
             b64.encode(ciphertext),
         )
+    }
+
+    #[tokio::test]
+    async fn encrypt_decrypt_round_trip() {
+        let key_b64 = random_key_b64();
+        let service = CryptoService::from_base64_key(&key_b64).expect("create service");
+
+        let plaintext = "sk-ant-api03-test-key-1234567890";
+        let encrypted = service.encrypt(plaintext).expect("encrypt");
+
+        // Verify format: iv:authTag:ciphertext
+        assert_eq!(encrypted.split(':').count(), 3);
+
+        let decrypted = service.decrypt(&encrypted).await.expect("decrypt");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn encrypt_produces_unique_ciphertexts() {
+        let key_b64 = random_key_b64();
+        let service = CryptoService::from_base64_key(&key_b64).expect("create service");
+
+        let e1 = service.encrypt("same").expect("encrypt 1");
+        let e2 = service.encrypt("same").expect("encrypt 2");
+        // Different random IVs → different ciphertexts
+        assert_ne!(e1, e2);
+    }
+
+    #[tokio::test]
+    async fn encrypt_interop_with_nodejs_format() {
+        // Verify our encrypt output can be decrypted, and the format matches
+        // what encrypt_like_nodejs produces (iv:tag:ciphertext, all base64)
+        let key_b64 = random_key_b64();
+        let service = CryptoService::from_base64_key(&key_b64).expect("create service");
+
+        let encrypted = service.encrypt("hello").expect("encrypt");
+        let parts: Vec<&str> = encrypted.splitn(3, ':').collect();
+        assert_eq!(parts.len(), 3);
+
+        // IV should decode to 12 bytes
+        let iv = base64::engine::general_purpose::STANDARD
+            .decode(parts[0])
+            .expect("iv base64");
+        assert_eq!(iv.len(), IV_LEN);
+
+        // Auth tag should decode to 16 bytes
+        let tag = base64::engine::general_purpose::STANDARD
+            .decode(parts[1])
+            .expect("tag base64");
+        assert_eq!(tag.len(), TAG_LEN);
     }
 
     #[tokio::test]

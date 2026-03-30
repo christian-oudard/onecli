@@ -65,7 +65,7 @@ anyhow = "1"
 time = "0.3"
 
 # Direct database access
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite"] }
 
 # Agent Access (Bitwarden vault credential injection)
 ap-client = "0.9.0"
