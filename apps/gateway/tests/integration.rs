@@ -1,8 +1,7 @@
 //! Integration tests for the onecli-gateway.
 //!
 //! **Standalone tests** (no DATABASE_URL needed) start the gateway with a
-//! `--rules` JSON file and verify health checks, tunneling, token auth, and
-//! CA persistence.
+//! `--rules` JSON file and verify tunneling, token auth, and CA persistence.
 //!
 //! **DB-dependent tests** require DATABASE_URL + SECRET_ENCRYPTION_KEY and
 //! are gated behind those env vars (silently skip when unset).
@@ -53,24 +52,14 @@ fn start_gateway(
         .spawn()
         .expect("start gateway process");
 
-    // Wait for gateway to be ready (poll health check)
+    // Wait for gateway to accept TCP connections.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if std::time::Instant::now() > deadline {
             panic!("gateway failed to start within 5 seconds");
         }
-        if let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{port}")) {
-            let req = format!("GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
-            if stream.write_all(req.as_bytes()).is_ok() {
-                let mut buf = [0u8; 256];
-                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                if let Ok(n) = stream.read(&mut buf) {
-                    let resp = String::from_utf8_lossy(&buf[..n]);
-                    if resp.contains("200") {
-                        break;
-                    }
-                }
-            }
+        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -86,25 +75,6 @@ fn write_rules(dir: &Path, json: &str) -> std::path::PathBuf {
 }
 
 // ── Standalone tests (no database) ──────────────────────────────────────
-
-#[test]
-fn standalone_health_check() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-    let (port, mut child) = start_gateway(tmp.path(), &[], &[]);
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-    let req = format!("GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
-    stream.write_all(req.as_bytes()).expect("send");
-
-    let mut buf = vec![0u8; 512];
-    let n = stream.read(&mut buf).expect("read");
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    assert!(resp.contains("HTTP/1.1 200"), "expected 200, got: {resp}");
-
-    child.kill().ok();
-    child.wait().ok();
-}
 
 #[test]
 fn standalone_non_connect_returns_400() {
@@ -289,33 +259,6 @@ fn require_db_env() -> Option<(String, String)> {
         .ok()
         .filter(|s| !s.is_empty())?;
     Some((db_url, key))
-}
-
-#[test]
-fn health_check_returns_200() {
-    let Some((db_url, key)) = require_db_env() else {
-        eprintln!("skipping: DATABASE_URL or SECRET_ENCRYPTION_KEY not set");
-        return;
-    };
-    let tmp = tempfile::tempdir().expect("create temp dir");
-    let (port, mut child) = start_gateway(
-        tmp.path(),
-        &[],
-        &[("DATABASE_URL", &db_url), ("SECRET_ENCRYPTION_KEY", &key)],
-    );
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-    let req = format!("GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
-    stream.write_all(req.as_bytes()).expect("send");
-
-    let mut buf = vec![0u8; 512];
-    let n = stream.read(&mut buf).expect("read");
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    assert!(resp.contains("HTTP/1.1 200"), "expected 200, got: {resp}");
-
-    child.kill().ok();
-    child.wait().ok();
 }
 
 #[test]

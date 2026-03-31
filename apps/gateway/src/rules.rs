@@ -25,7 +25,7 @@ pub(crate) struct RulesSnapshot {
 pub(crate) struct AgentRules {
     /// Agent access token. `None` for the anonymous / standalone agent.
     pub token: Option<String>,
-    /// Account ID — used by the vault service for credential lookup.
+    /// Account ID — used for app connection credential lookup.
     pub account_id: Option<String>,
     /// Per-host injection rules.
     pub host_rules: Vec<HostRule>,

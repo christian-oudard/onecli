@@ -1,4 +1,5 @@
 #[cfg(not(feature = "cloud"))]
+#[allow(dead_code)]
 mod auth;
 
 #[cfg(feature = "cloud")]
@@ -25,13 +26,13 @@ mod crypto;
 #[path = "cloud/crypto.rs"]
 mod crypto;
 
+#[allow(dead_code)]
 mod db;
 mod gateway;
 mod inject;
 mod policy;
 mod rules;
 mod token_state;
-mod vault;
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -44,8 +45,6 @@ use tracing_subscriber::EnvFilter;
 
 use crate::ca::CertificateAuthority;
 use crate::gateway::GatewayServer;
-use crate::vault::bitwarden::{BitwardenConfig, BitwardenVaultProvider};
-use crate::vault::VaultService;
 
 #[derive(Parser)]
 #[command(
@@ -200,46 +199,27 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── Optional database (vault integration only) ───────────────────────
+    // ── Optional database (browser auth only) ─────────────────────────
 
-    let db_url = std::env::var("DATABASE_URL").ok().or_else(|| {
+    let db_pool = match std::env::var("DATABASE_URL").ok().or_else(|| {
         let host = std::env::var("DB_HOST").ok()?;
         let port = std::env::var("DB_PORT").unwrap_or_else(|_| "5432".to_string());
         let user = std::env::var("DB_USERNAME").ok()?;
         let pass = std::env::var("DB_PASSWORD").ok()?;
         let name = std::env::var("DB_NAME").unwrap_or_else(|_| "onecli".to_string());
         Some(format!("postgresql://{user}:{pass}@{host}:{port}/{name}"))
-    });
-
-    let db_pool = match db_url {
+    }) {
         Some(url) => match db::create_pool(&url).await {
             Ok(pool) => {
-                info!("database connection established (vault integration enabled)");
+                info!("database connection established (browser auth enabled)");
                 Some(pool)
             }
             Err(e) => {
-                warn!(error = %e, "database connection failed; vault integration disabled");
+                warn!(error = %e, "database connection failed; browser auth disabled");
                 None
             }
         },
-        None => {
-            info!("no DATABASE_URL; running in standalone mode (vault integration disabled)");
-            None
-        }
-    };
-
-    // ── Vault service ────────────────────────────────────────────────────
-
-    // Keep a clone for browser auth (GatewayState.db_pool) before moving into vault service.
-    let db_pool_for_auth = db_pool.clone();
-
-    let vault_service = if let Some(pool) = db_pool {
-        let proxy_url = std::env::var("BITWARDEN_PROXY_URL")
-            .unwrap_or_else(|_| "wss://ap.lesspassword.dev".to_string());
-        let bitwarden = BitwardenVaultProvider::new(BitwardenConfig { proxy_url }, pool.clone());
-        Arc::new(VaultService::new(vec![Box::new(bitwarden)], Some(pool)))
-    } else {
-        Arc::new(VaultService::new(vec![], None))
+        None => None,
     };
 
     // ── Cache store ──────────────────────────────────────────────────────
@@ -279,8 +259,7 @@ async fn main() -> Result<()> {
             .expect("build HTTP client"),
         rules: rules_rx,
         cache,
-        vault_service,
-        db_pool: db_pool_for_auth,
+        db_pool,
         token_store,
     };
     let server = GatewayServer::new(cli.bind, cli.port, state);

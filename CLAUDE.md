@@ -50,7 +50,7 @@ cargo run -p onecli-gateway -- [flags]
 
 **Control socket:** Unix domain socket at `$XDG_RUNTIME_DIR/onecli/control.sock`. Accepts `POST /rules` with the same JSON format as `rules.json`. The web UI uses this to push config changes. Disable with `--no-control-socket`.
 
-**Database:** The gateway never requires PostgreSQL. When `DATABASE_URL` is set, legacy vault secret injection is available. Without it, the gateway runs fully standalone using only the rules file, control socket, and SQLite token state.
+**Database:** The gateway never requires PostgreSQL. When `DATABASE_URL` is set, browser auth (the `/me` endpoint) is available. Without it, the gateway runs fully standalone using only the rules file, control socket, and SQLite token state.
 
 ## Environment Variables
 

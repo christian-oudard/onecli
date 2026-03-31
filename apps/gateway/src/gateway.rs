@@ -1,17 +1,16 @@
 //! HTTP gateway server: connection handling, MITM interception, and tunneling.
 //!
 //! This module owns the `GatewayServer` struct and the core request flow:
-//! accept → authenticate → resolve (via [`connect`]) → MITM or tunnel.
+//! accept -> authenticate -> resolve (via [`connect`]) -> MITM or tunnel.
 //!
-//! Axum handles normal HTTP routes (/healthz). CONNECT requests are intercepted
-//! before reaching the router via a `tower::service_fn` wrapper, following the
-//! official Axum http-proxy example pattern.
+//! CONNECT requests are intercepted before reaching the Axum router (CONNECT URIs
+//! like `host:port` don't match Axum's path-based routing). Non-CONNECT requests
+//! get a 400 Bad Request. This is a proxy, not a web server.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
 use axum::Router;
 use futures_util::TryStreamExt;
 use http_body_util::{Either, Full, StreamBody};
@@ -24,14 +23,12 @@ use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
-use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 
 use sqlx::PgPool;
 use tokio::sync::watch;
 
 use crate::apps;
-use crate::auth::AuthUser;
 use crate::ca::CertificateAuthority;
 use crate::cache::CacheStore;
 use crate::connect::{self, ConnectError};
@@ -39,7 +36,6 @@ use crate::inject::{self, InjectionRule};
 use crate::policy::{self, PolicyDecision, PolicyRule};
 use crate::rules::RulesSnapshot;
 use crate::token_state::TokenStateStore;
-use crate::vault;
 
 // ── GatewayState ───────────────────────────────────────────────────────
 
@@ -52,9 +48,9 @@ pub(crate) struct GatewayState {
     /// `borrow()` returns the current snapshot with zero I/O.
     pub rules: watch::Receiver<Arc<RulesSnapshot>>,
     pub cache: Arc<dyn CacheStore>,
-    /// Provider-agnostic vault service for credential fetching.
-    pub vault_service: Arc<vault::VaultService>,
     /// Database pool for browser auth (None in standalone mode).
+    /// Currently unused in standalone builds but retained for cloud overlay.
+    #[allow(dead_code)]
     pub db_pool: Option<PgPool>,
     /// SQLite token state store for OAuth app connections (None if no encryption key).
     pub token_store: Option<Arc<TokenStateStore>>,
@@ -95,46 +91,8 @@ impl GatewayServer {
 
         info!(addr = %addr, "listening for connections");
 
-        // CORS configuration for browser → gateway requests.
-        // credentials: true requires explicit headers/methods (not wildcard *).
-        let cors_layer = CorsLayer::new()
-            .allow_origin(tower_http::cors::AllowOrigin::mirror_request())
-            .allow_headers([
-                hyper::header::CONTENT_TYPE,
-                hyper::header::AUTHORIZATION,
-                hyper::header::ACCEPT,
-            ])
-            .allow_methods([
-                Method::GET,
-                Method::POST,
-                Method::PUT,
-                Method::DELETE,
-                Method::OPTIONS,
-            ])
-            .allow_credentials(true);
-
-        // Build the Axum router for non-CONNECT routes.
-        // The fallback returns 400 Bad Request for anything other than defined routes.
+        // Non-CONNECT requests get 400 Bad Request. This is a proxy, not a web server.
         let axum_router = Router::new()
-            .route("/healthz", axum::routing::get(healthz))
-            .route("/me", axum::routing::get(me))
-            .route(
-                "/api/vault/{provider}/pair",
-                axum::routing::post(vault::api::vault_pair),
-            )
-            .route(
-                "/api/vault/{provider}/status",
-                axum::routing::get(vault::api::vault_status),
-            )
-            .route(
-                "/api/vault/{provider}/pair",
-                axum::routing::delete(vault::api::vault_disconnect),
-            )
-            .route(
-                "/api/cache/invalidate",
-                axum::routing::post(invalidate_cache),
-            )
-            .layer(cors_layer)
             .fallback(fallback)
             .with_state(self.state.clone());
 
@@ -152,33 +110,7 @@ impl GatewayServer {
     }
 }
 
-// ── Axum route handlers ─────────────────────────────────────────────────
-
-async fn healthz() -> StatusCode {
-    StatusCode::OK
-}
-
-/// Protected: returns the authenticated user's ID.
-async fn me(auth: AuthUser) -> String {
-    auth.user_id
-}
-
-/// Invalidate all cached CONNECT responses for the authenticated account.
-/// Called by the web app after secret/rule mutations so agents pick up
-/// changes immediately instead of waiting for the 60-second TTL.
-async fn invalidate_cache(
-    auth: AuthUser,
-    State(state): State<GatewayState>,
-) -> impl axum::response::IntoResponse {
-    let prefix = format!("connect:{}:", auth.account_id);
-    state.cache.del_by_prefix(&prefix).await;
-    (
-        StatusCode::OK,
-        axum::Json(serde_json::json!({ "invalidated": true })),
-    )
-}
-
-/// Reject non-CONNECT requests to unknown routes with 400 Bad Request.
+/// Non-CONNECT requests get 400 Bad Request. This is a proxy, not a web server.
 async fn fallback() -> StatusCode {
     StatusCode::BAD_REQUEST
 }
@@ -189,7 +121,7 @@ async fn fallback() -> StatusCode {
 ///
 /// Uses a `service_fn` wrapper that intercepts CONNECT requests before they reach
 /// the Axum router (CONNECT URIs like `host:port` don't match Axum's path-based routing).
-/// All other HTTP routes (vault API, healthz, etc.) go through the Axum router.
+/// Non-CONNECT requests fall through to the Axum router (which returns 400).
 async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
@@ -210,7 +142,6 @@ async fn handle_connection(
                     if req.method() == Method::CONNECT {
                         handle_connect(req, peer_addr, state).await
                     } else {
-                        // Axum handles all non-CONNECT routes (healthz, vault API, fallback)
                         let resp: Response<axum::body::Body> = router
                             .oneshot(req)
                             .await
@@ -259,24 +190,6 @@ async fn handle_connect(
             }
         }
     };
-
-    // Vault fallback: if no DB secrets matched, try vault providers for this user.
-    if !intercept {
-        if let Some(ref aid) = account_id {
-            if let Some(cred) = state.vault_service.request_credential(aid, &hostname).await {
-                let vault_rules = inject::vault_credential_to_rules(&hostname, &cred);
-                if !vault_rules.is_empty() {
-                    intercept = true;
-                    injection_rules = vault_rules;
-                    info!(
-                        host = %hostname,
-                        account_id = %aid,
-                        "using vault credential"
-                    );
-                }
-            }
-        }
-    }
 
     // App connection fallback: if an app connection matches this host,
     // read the OAuth token from SQLite and build injection rules.

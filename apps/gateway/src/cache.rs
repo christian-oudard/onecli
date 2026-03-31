@@ -1,7 +1,6 @@
 //! In-memory cache for rate limiting.
 //!
-//! Provides `del_by_prefix` (clear counters on rule reload) and
-//! `incr` (atomic counter with TTL for rate limit windows).
+//! Provides `incr` (atomic counter with TTL for rate limit windows).
 
 use std::time::{Duration, Instant};
 
@@ -11,9 +10,6 @@ use dashmap::DashMap;
 /// Rate-limit cache store.
 #[async_trait]
 pub(crate) trait CacheStore: Send + Sync {
-    /// Delete all keys matching a prefix.
-    async fn del_by_prefix(&self, prefix: &str);
-
     /// Atomically increment a counter at `key`.
     /// Sets TTL only on first increment (new key / expired key).
     /// Returns the new count, or `None` on error (graceful fallback).
@@ -52,10 +48,6 @@ impl InMemoryCacheStore {
 
 #[async_trait]
 impl CacheStore for InMemoryCacheStore {
-    async fn del_by_prefix(&self, prefix: &str) {
-        self.map.retain(|key, _| !key.starts_with(prefix));
-    }
-
     async fn incr(&self, key: &str, ttl_secs: u64) -> Option<u64> {
         let now = Instant::now();
         let ttl = Duration::from_secs(ttl_secs);
@@ -77,45 +69,3 @@ impl CacheStore for InMemoryCacheStore {
     }
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    fn new_store() -> Arc<dyn CacheStore> {
-        Arc::new(InMemoryCacheStore::new())
-    }
-
-    #[tokio::test]
-    async fn del_by_prefix_removes_matching_entries() {
-        let store = new_store();
-
-        // Seed some entries via incr
-        store.incr("connect:acc1:tok1:host1", 60).await;
-        store.incr("connect:acc1:tok2:host2", 60).await;
-        store.incr("connect:acc2:tok3:host3", 60).await;
-        store.incr("rate:rule1:tok1:123", 60).await;
-
-        store.del_by_prefix("connect:acc1:").await;
-
-        // Deleted entries return count=1 (fresh) on next incr
-        assert_eq!(
-            store.incr("connect:acc1:tok1:host1", 60).await,
-            Some(1),
-            "should be fresh after delete"
-        );
-        // Surviving entries return count=2 (already had 1)
-        assert_eq!(
-            store.incr("connect:acc2:tok3:host3", 60).await,
-            Some(2),
-            "should still have prior count"
-        );
-        assert_eq!(
-            store.incr("rate:rule1:tok1:123", 60).await,
-            Some(2),
-            "non-matching prefix should survive"
-        );
-    }
-}

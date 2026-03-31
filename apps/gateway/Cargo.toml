@@ -19,7 +19,6 @@ http-body = "1"
 http-body-util = "0.1"
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors"] }
 
 # TLS
 tokio-rustls = "0.26"
@@ -67,13 +66,7 @@ time = "0.3"
 # Direct database access
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite"] }
 
-# Agent Access (Bitwarden vault credential injection)
-ap-client = "0.9.0"
-ap-proxy-client = "0.9.0"
-ap-proxy-protocol = "0.9.0"
-ap-noise = "0.9.0"
 async-trait = "0.1"
-hex = "0.4"
 
 [features]
 cloud = ["dep:aws-sdk-kms", "dep:aws-config", "dep:redis", "dep:percent-encoding"]
